@@ -2,7 +2,7 @@
 
 The library calls still require an `AuthContext`. The TCP service does too. It binds `127.0.0.1` unless the operator sets `--allow-remote`, and it refuses to start with an empty tenant policy. A data request with an unknown tenant, a mismatched trust domain, or a wrong fingerprint is `Unauthorized` and returns no payload. Hello carries versions and the store epoch only.
 
-The fingerprint is a hash of a credential, never the credential. Do not pass a raw secret on the command line in a place that records process arguments if you can avoid it; V1 still takes the hex fingerprint as an argument because there is no secret store yet. An all-zero fingerprint is rejected before a request is built.
+The fingerprint is derived from a credential, but the current protocol accepts that fingerprint directly: it is a bearer-equivalent secret. Capturing it on plaintext TCP permits impersonation. Do not pass a raw secret on the command line in a place that records process arguments if you can avoid it; V1 still takes the hex fingerprint as an argument because there is no secret store yet. An all-zero fingerprint is rejected before a request is built.
 
 ## What is enforced
 
@@ -27,7 +27,7 @@ These sit beside the V1 gate. They do not replace it and they do not add mTLS. S
 
 ## What is not enforced
 
-- mTLS is not linked. The TCP service does not call `Acl` or `ReplayGuard` yet; those are library hooks a caller can use beside the V1 fingerprint. `--allow-remote` does not add them and does not terminate TLS. Treat a non-loopback bind as a trusted fabric, or do not bind it.
+- mTLS is not linked. The TCP service does not call `Acl`, `ReplayGuard`, `RateGate`, or `SecretRing` yet; those are library hooks a caller can use beside the V1 fingerprint. `--allow-remote` does not add them and does not terminate TLS. Treat a non-loopback bind as a trusted fabric, or do not bind it.
 - Replay protection beyond the idempotency window and the bounded nonce window is not a permanent cache.
 - `Attestation::Drained` is accepted from any caller who already passed the tenant gate. It is not a device measurement. A buggy client inside the tenant can reclaim its own in-flight buffer early.
 - The idempotency table forgets entries after `idempotency_ttl_ms` or when it is full (new ids are then rejected until expiry). Reusing an id after expiry can run the operation again.

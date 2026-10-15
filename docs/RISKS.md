@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | Wrong-tenant or wrong-layout hit | Mitigated in `MemoryStore` tests | Physical key includes tenant and layout. Incompatible lookup returns a miss and no bytes. |
 | Reclaim of a buffer that might still be copied | Mitigated by quarantine | Timeout and `KnownIdle` do not free a registered region. |
-| Unbounded memory | Mitigated by quotas | Admission fails instead of evicting. Quarantine still holds bytes until fence or drain, which is intentional and counted against the quota. |
+| Unbounded memory | Partially mitigated | Retained payloads and writers have quotas; FileStore can evict unpinned committed blocks. Reader pins and some auxiliary metadata remain uncapped. Protocol reply copies also need byte admission. Quarantine stays charged until fence or drain. |
 | Idempotency window expiry | Accepted | After TTL, a request id may run again. Callers must not reuse ids they still care about. |
 | `Drained` is only tenant-authenticated | Accepted for V1 A | Not a device proof. Documented in SECURITY.md. |
 | No real engine bytes | `NOT_RUN_HARDWARE` | Synthetic frames can pass while a real vLLM layout still mismatches. |

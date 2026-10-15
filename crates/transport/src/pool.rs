@@ -56,6 +56,10 @@ impl Pool {
 }
 
 impl Pooled {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
     pub fn buf_mut(&mut self) -> &mut Vec<u8> {
         &mut self.buf
     }

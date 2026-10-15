@@ -41,7 +41,7 @@ The hot TCP service does not depend on `gpucache-cold`. RustFS is not on the pre
 | Async sink | `AsyncSink` queues that pair up to a job and byte cap. `drain` puts the object, then the manifest. `cancel` drops the queue and writes nothing | Host buffers until drain. Not a runtime thread pool |
 | Mock store | In-process map. Contract test covers Put, Head, RangeGet, Delete | Not RustFS. Not a measurement |
 | Live HTTP | `live_probe` runs only when `GPUCACHE_RUSTFS_*` is set. Otherwise `NOT_RUN_HARDWARE` | Full HTTP body copy. Not GDS |
-| Refill | Head the manifest. If its length exceeds the budget, return `OverBudget` and do not download it. Otherwise download the manifest, and RangeGet one generation only when that range fits. Checksum mismatch is an error, not a hit | Host copy of the manifest and, when allowed, one payload range |
+| Refill | Head the manifest. If its length exceeds the budget, return `OverBudget` and do not download it. Otherwise download the manifest, and RangeGet one generation only when manifest bytes plus that range fit the total byte budget. Checksum mismatch is an error, not a hit | Host copy of the manifest and, when allowed, one payload range |
 | Promote into G3.5 | A later hot `Put` through the TCP API | A separate host copy. Not chained to the GET |
 
 GDS and BlueField storage DMA are in development and were not run.

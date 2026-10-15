@@ -424,3 +424,109 @@ fn tenant_quota_does_not_evict_another_tenant() {
         Ok(LookupOutcome::Hit { .. })
     ));
 }
+
+#[test]
+fn rejected_reservations_do_not_evict_committed_data() {
+    for case in 0..7 {
+        let dir = TempDir::new();
+        let (policy, auth) = policy(1, FP_A);
+        let mut tight = limits(32, 16);
+        tight.max_object_bytes = 16;
+        let mut store = FileStore::open(&dir.path, tight, vec![policy]).unwrap();
+        let identity = synthetic_identity(1, 1);
+        let generation = commit_block(&mut store, &auth, 10, &block(1), identity.clone());
+        let mut other = identity.clone();
+        other.prefix_chain[0].0[0] ^= 0xff;
+        let mut request = put(store.epoch(), 20, &block(2), other);
+        let mut caller = auth.clone();
+        match case {
+            0 => caller.credential_fingerprint = FP_B,
+            1 => request.header.epoch += 1,
+            2 => request.header.deadline_ms = 1,
+            3 => request.length = 17,
+            4 => request.payload = Some(vec![2; 15]),
+            5 => request.identity.tenant = TenantId::new(b"other".to_vec()).unwrap(),
+            6 => request.identity = identity.clone(),
+            _ => unreachable!(),
+        }
+        let _ = store.reserve_put(&caller, 2, vec![request]);
+        assert!(store.committed_path(generation).exists(), "case {case}");
+        let reply = store
+            .lookup(
+                &auth,
+                2,
+                vec![LookupItem {
+                    header: header(store.epoch(), 30),
+                    identity,
+                }],
+            )
+            .unwrap();
+        assert!(
+            matches!(reply.items[0].body, Ok(LookupOutcome::Hit { .. })),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn replayed_reservation_does_not_evict_its_own_commit() {
+    let dir = TempDir::new();
+    let (policy, auth) = policy(1, FP_A);
+    let mut store = FileStore::open(&dir.path, limits(32, 16), vec![policy]).unwrap();
+    let identity = synthetic_identity(1, 1);
+    let generation = commit_block(&mut store, &auth, 10, &block(1), identity.clone());
+    let reply = store
+        .reserve_put(&auth, 0, vec![put(store.epoch(), 10, &block(1), identity)])
+        .unwrap();
+    assert_eq!(reply.items[0].body.as_ref().unwrap().generation, generation);
+    assert!(store.committed_path(generation).exists());
+}
+
+#[test]
+fn duplicate_reservation_batch_is_rejected_before_mutation() {
+    let dir = TempDir::new();
+    let (policy, auth) = policy(1, FP_A);
+    let mut store = FileStore::open(&dir.path, limits(64, 64), vec![policy]).unwrap();
+    let request = put(store.epoch(), 10, &block(1), synthetic_identity(1, 1));
+    assert!(matches!(
+        store.reserve_put(&auth, 0, vec![request.clone(), request]),
+        Err(CacheError::Malformed {
+            reason: "duplicate request_id"
+        })
+    ));
+    assert_eq!(store.stats().retained_bytes, 0);
+}
+
+#[test]
+fn lookup_and_get_keep_recency_in_memory_without_writing_lru() {
+    let dir = TempDir::new();
+    let (policy, auth) = policy(1, FP_A);
+    let mut store = FileStore::open(&dir.path, limits(64, 64), vec![policy]).unwrap();
+    let identity = synthetic_identity(1, 1);
+    let generation = commit_block(&mut store, &auth, 10, &block(1), identity.clone());
+    let sentinel = b"do not rewrite advisory recency on reads";
+    fs::write(dir.path.join("LRU"), sentinel).unwrap();
+    store
+        .lookup(
+            &auth,
+            0,
+            vec![LookupItem {
+                header: header(store.epoch(), 20),
+                identity: identity.clone(),
+            }],
+        )
+        .unwrap();
+    store
+        .get(
+            &auth,
+            0,
+            vec![GetItem {
+                header: header(store.epoch(), 21),
+                generation,
+                identity,
+                pin_ttl_ms: 100,
+            }],
+        )
+        .unwrap();
+    assert_eq!(fs::read(dir.path.join("LRU")).unwrap(), sentinel);
+}

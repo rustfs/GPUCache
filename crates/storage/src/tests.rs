@@ -839,3 +839,31 @@ fn hex(bytes: &[u8]) -> String {
     }
     out
 }
+
+#[test]
+fn replay_state_is_scoped_to_the_authenticated_tenant() {
+    let mut other = synthetic_identity(1, 1);
+    other.tenant = TenantId::new(b"tenant-b".to_vec()).unwrap();
+    let policy = TenantPolicy::new(other.tenant.clone(), other.trust_domain.clone(), FP).unwrap();
+    let other_auth =
+        AuthContext::new(other.tenant.clone(), other.trust_domain.clone(), FP).unwrap();
+    let (mut store, auth) = open(Some(policy));
+    let generation = commit_bytes(&mut store, &auth, 10, b"payload");
+    let denied = store
+        .commit(
+            &other_auth,
+            0,
+            vec![CommitItem {
+                header: hdr(&store, 11, 0),
+                generation,
+                length: 7,
+                checksum: content_checksum(b"payload"),
+            }],
+        )
+        .unwrap();
+    assert_eq!(denied.items[0].body, Err(CacheError::Unauthorized));
+    let mut request = put_item(&store, 10, 0, b"other", 1);
+    request.identity = other;
+    let independent = store.reserve_put(&other_auth, 0, vec![request]).unwrap();
+    assert!(independent.items[0].body.is_ok());
+}

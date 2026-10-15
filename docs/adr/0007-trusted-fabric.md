@@ -17,10 +17,10 @@ The V3 boundary is a **trusted fabric**, documented here, plus CPU hooks. mTLS i
 Operators:
 
 - Leave the listener on `127.0.0.1` unless the host network is already restricted to cache peers.
-- `--allow-remote` does not add authentication and does not start TLS. The fingerprint and the V3 ACL still apply.
+- `--allow-remote` does not add authentication and does not start TLS. The V1 fingerprint gate still applies. The TCP service does not call the V3 ACL, replay guard, rate gate, or secret ring.
 - Do not place this TCP service on an open network and call that mTLS.
 
-In-process hooks, all caller-clocked and bounded:
+In-process hooks (the ACL, nonce window, rate windows, and audit log have caps; secret-rotation history currently grows without a cap):
 
 - `Acl` maps a fingerprint to read or write. An empty ACL fails closed. A read grant is not a write grant. The fingerprint compare scans every entry.
 - `ReplayGuard` accepts a nonce once inside a caller-supplied skew. The window is bounded. Evicting the oldest nonce means that nonce can appear again later. This is not an infinite replay cache.

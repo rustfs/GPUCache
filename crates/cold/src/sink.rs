@@ -43,6 +43,7 @@ impl ColdJob {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefillBudget {
+    /// Total downloaded manifest plus payload bytes per refill.
     pub max_bytes: u64,
     pub max_ranges: u32,
 }
@@ -199,7 +200,7 @@ pub fn refill_generation(
     else {
         return Ok(RefillOutcome::Missing);
     };
-    if range.length == 0 || range.length > budget.max_bytes {
+    if range.length == 0 || range.length > budget.max_bytes.saturating_sub(meta.len) {
         return Ok(RefillOutcome::OverBudget);
     }
     load_range(store, &manifest, range.offset, range.length, range.checksum)
@@ -348,5 +349,39 @@ mod tests {
         assert_eq!(outcome, RefillOutcome::OverBudget);
         assert_eq!(store.manifest_ranges.get(), 0);
         assert_eq!(store.object_ranges.get(), 0);
+    }
+    #[test]
+    fn refill_charges_manifest_and_payload_to_one_budget() {
+        let pack = pack_blocks("total-budget", &[block(1, 1, 32)]).unwrap();
+        let mut store = CountStore {
+            inner: MockObjectStore::default(),
+            manifest_ranges: Cell::new(0),
+            object_ranges: Cell::new(0),
+        };
+        store.put(&pack.manifest_key, &pack.manifest_bytes).unwrap();
+        store.put(&pack.object_key, &pack.object_bytes).unwrap();
+        let total = pack.manifest_bytes.len() as u64 + 32;
+        assert_eq!(
+            refill_generation(
+                &store,
+                &pack.manifest_key,
+                1,
+                &RefillBudget::new(total - 1, 1).unwrap()
+            )
+            .unwrap(),
+            RefillOutcome::OverBudget
+        );
+        assert_eq!(store.object_ranges.get(), 0);
+        assert!(matches!(
+            refill_generation(
+                &store,
+                &pack.manifest_key,
+                1,
+                &RefillBudget::new(total, 1).unwrap()
+            )
+            .unwrap(),
+            RefillOutcome::Loaded { .. }
+        ));
+        assert_eq!(store.object_ranges.get(), 1);
     }
 }

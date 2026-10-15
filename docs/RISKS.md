@@ -13,7 +13,10 @@
 | LRU admission | Mitigated with a pin check | Unpinned committed blocks can be evicted. Pinned and quarantined blocks are not. After a missing `LRU` file, order falls back to ascending generation. |
 | Partial prefix | Documented in ADR 0003 | Whole-block prefix only. A client that ignores `matched_prefix_blocks` can mis-align. Intra-block slice is a miss. |
 | RustFS live probe | `NOT_RUN_HARDWARE` | Mock Put/Head/RangeGet/Delete passes. A mock is not a measured RustFS run. |
-| No RDMA / DPU measurement | `NOT_RUN_HARDWARE` | Do not infer a speedup from this milestone. |
+| No RDMA / DPU measurement | `NOT_RUN_HARDWARE` | Feature `rdma-nixl` does not link libnixl. Do not infer a speedup. GDS and BlueField stay in development. |
+| Simulated registration treated as a NIC pin | Mitigated by labeling | `RegisteredPool` uses `Vec<u8>`. `shard-demo` prints `registration=SIMULATED`. |
+| Shard directory treated as a replica | Mitigated by ADR 0005 | Membership fences fills. It does not copy payload bytes and it does not vote a quorum. |
+| Cold refill over budget returned as a hit | Mitigated | `OverBudget` and `Missing` carry no payload. Checksum failure is an error. |
 | License of a future DOCA or model stack | `NOT_RUN_LICENSE` | No DOCA binary and no model weights are in the tree. |
 | GPU rental or DPU purchase | `NOT_RUN_BUDGET` | No paid API, GPU, or DPU was used. |
 | Hot block loss | Accepted | No erasure coding and no durability replicas. The outcome is a clean miss, then recompute and repopulate. Cold durability is RustFS G4. See ADR 0002. |

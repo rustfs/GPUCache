@@ -13,11 +13,11 @@ Recorded for V1 milestones A, B, and C. This file is not a performance acceptanc
 | GPU / driver | None in this environment | `NOT_RUN_HARDWARE` |
 | vLLM | Not pinned; no engine commit | `NOT_RUN_HARDWARE` |
 | LMCache | Not a dependency | `NOT_RUN_HARDWARE` (route undecided) |
-| NIXL / UCX / RDMA | Not a dependency | Not in V1 |
-| DOCA / BlueField BFB / firmware | Not present | `NOT_RUN_HARDWARE` |
-| RustFS server / client | No endpoint authorized in this environment. Contract mock covers Put, Head, RangeGet, Delete, pack, and manifest | Live probe `NOT_RUN_HARDWARE`. Mock `PASS` |
+| NIXL / UCX / RDMA | Not linked. Candidate recorded: `nixl-sys` 1.3.1 (crates.io, updated 2026-07-07; docs.rs also lists 1.5.0), Apache-2.0, repo `ai-dynamo/nixl`. Feature `rdma-nixl` has no crate dependency. `stub-api` aborts on call, so it is not used. Mooncake Transfer Engine is Apache-2.0 and was not linked (in-tree `unsafe` FFI, not a pinned crates.io crate) | Live RDMA `NOT_RUN_HARDWARE`. `NixlTransport::open` returns `rdma not linked` with and without the feature |
+| DOCA / BlueField BFB / firmware / GDS | Not present. Wording stays in development / `NOT_RUN_HARDWARE` | `NOT_RUN_HARDWARE` |
+| RustFS server / client | No endpoint authorized in this environment. Contract mock covers Put, Head, RangeGet, Delete, pack, manifest, async sink, and cost-bounded refill | Live probe `NOT_RUN_HARDWARE`. Mock `PASS` |
 | TCP / file store | Loopback TCP and a temp directory on the build host | `PASS` for `cargo test --workspace --all-targets` on x86_64. Not an NVMe format and not a DPU run |
-| Direct Rust deps | `sha2` 0.10.8; dev `proptest` 1.4.0 | Apache-2.0 OR MIT; see `Cargo.lock`. V1 C adds no direct crate. `gpucache-bench` has an empty dependency list |
+| Direct Rust deps | `sha2` 0.10.8; dev `proptest` 1.4.0 | Apache-2.0 OR MIT; see `Cargo.lock`. The V2 slice adds no direct crate. `gpucache-bench` has an empty dependency list. Optional feature `rdma-nixl` adds none |
 | License of this repo | Apache-2.0 | See `LICENSE` |
 
 CI (see `.github/workflows/ci.yml`) builds and runs the same tests on x86_64 and on aarch64 (GitHub ARM runner, plus qemu-user cross execution). An aarch64 result is a CPU result. It does not certify BlueField-3, DOCA, or NVMe-on-DPU.

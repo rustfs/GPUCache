@@ -1,6 +1,6 @@
 # Third-party notices
 
-GPUCache V1 A, V1 B, and V1 C are Apache-2.0. See [LICENSE](LICENSE). V1 C adds no direct dependency.
+GPUCache is Apache-2.0. See [LICENSE](LICENSE). The V2 first slice adds no direct dependency. NIXL (`nixl-sys`, Apache-2.0) and Mooncake (Apache-2.0) were audited and not linked. See [docs/adr/0004-nixl-transport.md](docs/adr/0004-nixl-transport.md).
 
 Direct dependencies:
 

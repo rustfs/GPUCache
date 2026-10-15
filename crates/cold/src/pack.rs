@@ -33,6 +33,13 @@ pub struct PayloadRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Manifest {
+    pub object_checksum: Checksum,
+    pub object_key: String,
+    pub ranges: Vec<PayloadRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pack {
     pub object_key: String,
     pub manifest_key: String,
@@ -128,13 +135,13 @@ pub fn contract_smoke(store: &mut dyn ObjectStore) -> Result<(), CacheError> {
     if manifest_meta.checksum != content_checksum(&pack.manifest_bytes) {
         return Err(CacheError::ChecksumMismatch);
     }
-    let decoded = decode_manifest(&pack.manifest_bytes)?;
-    if decoded.len() != pack.ranges.len() {
+    let decoded = read_manifest(&pack.manifest_bytes)?;
+    if decoded.object_key != pack.object_key || decoded.ranges.len() != pack.ranges.len() {
         return Err(CacheError::Malformed {
             reason: "cold manifest",
         });
     }
-    let range = &decoded[1];
+    let range = &decoded.ranges[1];
     let got = store.range_get(&pack.object_key, range.offset, range.length)?;
     verify_checksum(&got, range.checksum)?;
     if got != blocks[1].payload {
@@ -166,7 +173,7 @@ fn sample_blocks() -> Result<Vec<PackedBlock>, CacheError> {
     Ok(out)
 }
 
-fn decode_manifest(bytes: &[u8]) -> Result<Vec<PayloadRange>, CacheError> {
+pub fn read_manifest(bytes: &[u8]) -> Result<Manifest, CacheError> {
     let mut r = ByteReader::new(bytes);
     let magic = r.raw(4)?;
     if magic != MANIFEST_MAGIC || r.u16()? != VERSION {
@@ -174,8 +181,18 @@ fn decode_manifest(bytes: &[u8]) -> Result<Vec<PayloadRange>, CacheError> {
             reason: "store corrupt",
         });
     }
-    let _object_checksum = r.array32()?;
-    let _object_key = r.bytes(1024)?;
+    let object_checksum = Checksum(r.array32()?);
+    let object_key_bytes = r.bytes(1024)?;
+    let object_key = std::str::from_utf8(object_key_bytes)
+        .map_err(|_| CacheError::Storage {
+            reason: "store corrupt",
+        })?
+        .to_string();
+    if !key_ok(&object_key) {
+        return Err(CacheError::Storage {
+            reason: "store corrupt",
+        });
+    }
     let n = r.u32()? as usize;
     if n == 0 || n > 1024 {
         return Err(CacheError::Malformed {
@@ -192,10 +209,14 @@ fn decode_manifest(bytes: &[u8]) -> Result<Vec<PayloadRange>, CacheError> {
         });
     }
     r.finish()?;
-    Ok(ranges)
+    Ok(Manifest {
+        object_checksum,
+        object_key,
+        ranges,
+    })
 }
 
-fn key_ok(key: &str) -> bool {
+pub(crate) fn key_ok(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 256
         && key

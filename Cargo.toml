@@ -4,6 +4,8 @@ members = [
     "crates/core-types",
     "crates/protocol",
     "crates/storage",
+    "crates/cold",
+    "crates/transport",
 ]
 
 [workspace.package]
@@ -19,6 +21,8 @@ sha2 = "=0.10.8"
 gpucache-core-types = { path = "crates/core-types" }
 gpucache-protocol = { path = "crates/protocol" }
 gpucache-storage = { path = "crates/storage" }
+gpucache-cold = { path = "crates/cold" }
+gpucache-transport = { path = "crates/transport" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

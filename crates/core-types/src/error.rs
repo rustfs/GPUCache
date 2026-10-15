@@ -73,6 +73,10 @@ pub enum CacheError {
     IdentityInvalid {
         reason: &'static str,
     },
+    /// Local storage or transport failure. The reason is a static label, never a path or payload.
+    Storage {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for CacheError {
@@ -110,6 +114,7 @@ impl fmt::Display for CacheError {
                 write!(f, "epoch mismatch store {store} request {request}")
             }
             Self::IdentityInvalid { reason } => write!(f, "identity invalid: {reason}"),
+            Self::Storage { reason } => write!(f, "storage: {reason}"),
         }
     }
 }

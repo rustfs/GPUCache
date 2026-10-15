@@ -23,6 +23,6 @@ DOCA EC, SPDK RAID targets, and similar offloads are not GPUCache components. Th
 ## Consequences
 
 - The README and roadmap do not list an EC milestone.
-- The V1 A crates have no EC types, no parity buffers, and no replica placement.
-- RustFS remains responsible for any durable cold object it is later asked to store. That client is not in V1 A.
+- The V1 crates have no EC types, no parity buffers, and no replica placement. The V1 B file backend deletes or skips a bad file; it does not rebuild one.
+- RustFS remains responsible for any durable cold object it is asked to store. The V1 B cold client is off the hot path and is a contract mock unless an authorized endpoint is configured.
 - A cache miss after a node loss is correct behavior. The KV block is not the user's only copy.

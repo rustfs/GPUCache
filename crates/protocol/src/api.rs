@@ -102,15 +102,53 @@ pub enum MissReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LookupOutcome {
+    /// Exact physical-key match. The bytes cover the whole requested block.
     Hit {
         generation: u64,
         length: u64,
         checksum: Checksum,
         valid_length: u32,
     },
+    /// Whole stored block whose prefix chain is a strict prefix of the query.
+    ///
+    /// This is not a sliced block. `matched_prefix_blocks` is the stored chain
+    /// length. `Get` must use [`identity_for_prefix_hit`], not the longer query.
+    PrefixHit {
+        generation: u64,
+        length: u64,
+        checksum: Checksum,
+        valid_length: u32,
+        matched_prefix_blocks: u32,
+    },
     Miss {
         reason: MissReason,
     },
+}
+
+/// Rebuild the stored identity for a [`LookupOutcome::PrefixHit`].
+///
+/// The result keeps the query layout and truncates the hash chain. It does not
+/// invent bytes for the suffix, and it rejects a chain that is not strictly shorter.
+pub fn identity_for_prefix_hit(
+    query: &CacheIdentity,
+    valid_length: u32,
+    matched_prefix_blocks: u32,
+) -> Result<CacheIdentity, CacheError> {
+    let n = matched_prefix_blocks as usize;
+    if matched_prefix_blocks == 0 || n >= query.prefix_chain.len() {
+        return Err(CacheError::Malformed {
+            reason: "prefix hit alignment",
+        });
+    }
+    if valid_length == 0 || valid_length > query.block_token_count {
+        return Err(CacheError::IdentityInvalid {
+            reason: "valid length",
+        });
+    }
+    let mut matched = query.clone();
+    matched.prefix_chain.truncate(n);
+    matched.valid_length = valid_length;
+    Ok(matched)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

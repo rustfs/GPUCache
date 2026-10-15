@@ -17,7 +17,7 @@ V1 must pick one primary path. Maintaining both half-implemented is how layout b
 
 **No route is selected.** The spike was not run.
 
-This environment has no GPU, no approved model weights, and no budget for a rented accelerator. The spike is `NOT_RUN_HARDWARE`. V1 A therefore stops at the CPU contract: versioned identity, the batch protocol, and `MemoryStore`. Neither vLLM nor LMCache is a crate dependency.
+This environment has no GPU, no approved model weights, and no budget for a rented accelerator. The spike is `NOT_RUN_HARDWARE`. V1 A stopped at the CPU contract. V1 B adds TCP and a file backend and still does not select a route. Neither vLLM nor LMCache is a crate dependency. Status stays **Pending** until the spike exists.
 
 When a GPU is authorized, the spike should:
 

@@ -98,6 +98,7 @@ pub fn import_committed_block(
     match one(looked.items)? {
         LookupOutcome::Hit { checksum, .. } if checksum == frame.checksum => {}
         LookupOutcome::Hit { .. } => return Err(CacheError::ChecksumMismatch),
+        LookupOutcome::PrefixHit { .. } => return Err(CacheError::Incompatible),
         LookupOutcome::Miss { .. } => {
             return Err(CacheError::NotExposed {
                 state: gpucache_core_types::BlockState::Absent,

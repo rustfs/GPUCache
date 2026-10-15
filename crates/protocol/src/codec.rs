@@ -17,14 +17,14 @@ pub const WIRE_MAGIC: &[u8; 4] = b"GCK1";
 pub const EXPORT_MAGIC: &[u8; 4] = b"GEXP";
 pub const EXPORT_VERSION: u16 = 1;
 
-const OP_LOOKUP: u16 = 1;
-const OP_RESERVE: u16 = 2;
-const OP_COMMIT: u16 = 3;
-const OP_GET: u16 = 4;
-const OP_RELEASE: u16 = 5;
-const OP_INVALIDATE: u16 = 6;
-const OP_HELLO: u16 = 7;
-const OP_HELLO_ACK: u16 = 8;
+pub const OP_LOOKUP: u16 = 1;
+pub const OP_RESERVE: u16 = 2;
+pub const OP_COMMIT: u16 = 3;
+pub const OP_GET: u16 = 4;
+pub const OP_RELEASE: u16 = 5;
+pub const OP_INVALIDATE: u16 = 6;
+pub const OP_HELLO: u16 = 7;
+pub const OP_HELLO_ACK: u16 = 8;
 
 const MAX_ITEMS: usize = 1024;
 
@@ -53,7 +53,7 @@ pub fn encode_request(auth: &AuthContext, body: &RequestBody) -> Result<Vec<u8>,
     let mut w = ByteWriter::with_capacity(128);
     w.raw(WIRE_MAGIC);
     w.u16(WIRE_VERSION);
-    w.u16(op_of(body));
+    w.u16(request_op(body));
     write_auth(&mut w, auth)?;
     w.u32(
         u32::try_from(body.len()).map_err(|_| CacheError::Malformed {
@@ -331,7 +331,7 @@ pub fn decode_export(bytes: &[u8]) -> Result<CommittedExport, CacheError> {
     })
 }
 
-fn op_of(body: &RequestBody) -> u16 {
+pub fn request_op(body: &RequestBody) -> u16 {
     match body {
         RequestBody::Lookup(_) => OP_LOOKUP,
         RequestBody::ReservePut(_) => OP_RESERVE,

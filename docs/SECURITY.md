@@ -1,6 +1,8 @@
-# Security (V1 A)
+# Security (V1 B)
 
-V1 A is a library. It does not listen on a network. Binding it to a public address without authentication would violate the product rule; nothing in this milestone opens a socket.
+The library calls still require an `AuthContext`. The TCP service does too. It binds `127.0.0.1` unless the operator sets `--allow-remote`, and it refuses to start with an empty tenant policy. A data request with an unknown tenant, a mismatched trust domain, or a wrong fingerprint is `Unauthorized` and returns no payload. Hello carries versions and the store epoch only.
+
+The fingerprint is a hash of a credential, never the credential. Do not pass a raw secret on the command line in a place that records process arguments if you can avoid it; V1 still takes the hex fingerprint as an argument because there is no secret store yet. An all-zero fingerprint is rejected before a request is built.
 
 ## What is enforced
 
@@ -17,7 +19,9 @@ V1 A is a library. It does not listen on a network. Binding it to a public addre
 - mTLS, replay protection beyond the idempotency window, secret rotation, and audit shipping are later work (the product note puts production hardening in V3; V1 still requires this minimum gate before any network exposure).
 - `Attestation::Drained` is accepted from any caller who already passed the tenant gate. It is not a device measurement. A buggy client inside the tenant can reclaim its own in-flight buffer early.
 - The idempotency table forgets entries after `idempotency_ttl_ms` or when it is full (new ids are then rejected until expiry). Reusing an id after expiry can run the operation again.
-- This crate does not encrypt KV bytes at rest. MemoryStore keeps them in process memory.
+- This tree does not encrypt KV bytes at rest. `MemoryStore` keeps them in process memory. `FileStore` writes them as ordinary files in the directory you name. That directory must not be a production disk or a device node. The open path rejects `/dev`, `/proc`, `/sys`, `/`, and `..`.
+- TCP has no mTLS and no replay window beyond idempotency. Do not expose it past a trusted host. `--allow-remote` does not add authentication; the fingerprint check is still the only gate.
+- `PrefixHit` bytes cover only `matched_prefix_blocks` of the query chain. A client that ignores that field and decodes them as the full query will mis-align. The server will not do that alignment for the client.
 
 ## Fallback
 

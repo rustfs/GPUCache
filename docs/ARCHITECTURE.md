@@ -1,22 +1,27 @@
-# Architecture (V1 A)
+# Architecture (V1 B)
 
-GPUCache is a shared KV data tier. The hot tier is G3.5. RustFS is an optional colder G4 capacity tier and is not implemented in this milestone. The inference engine still owns tokenization, attention, and scheduling. This repo does not replace them.
+GPUCache is a shared KV data tier. The hot tier is G3.5. RustFS is an optional colder G4 capacity tier. It is not on the prefill-to-decode path. The inference engine still owns tokenization, attention, and scheduling. This repo does not replace them.
 
 ```text
 engine (not in tree; spike NOT_RUN_HARDWARE)
         |
         |  CacheIdentity + batch API
         v
-gpucache-protocol
+gpucache-transport   TCP, loopback by default, tenant fingerprint
+        |
+        v
+gpucache-storage::FileStore  -->  directory of ordinary files
         |
         v
 gpucache-storage::MemoryStore
         |
         v
 gpucache-core-types  (identity, keys, lifecycle, errors)
+
+gpucache-cold        optional G4 pack/manifest. Not linked by transport.
 ```
 
-Planned crates that are **not** in V1 A: `metadata` as a standalone service, `transport` (TCP), file/NVMe store, RustFS object store, engine adapter, DPU agent, bench harness, metrics. Their contracts are reserved so later milestones do not push GPU or DPU types into `core-types`.
+`MemoryStore` remains the in-process contract. `FileStore` is what the TCP service uses. Planned crates still absent: a standalone metadata service, an engine adapter, a DPU agent, a bench harness, and metrics. Their contracts stay out of `core-types` so GPU and DPU types do not leak in.
 
 ## Durability
 
@@ -33,7 +38,9 @@ Keys:
 - Logical prefix key (`GPCL`): tenant, model, tokenizer, adapter, prefix hashes, multimodal digests. Layout and shard are absent on purpose.
 - Physical byte key (`GPCK`): the logical fields plus dtype, quant, layout, shard, RoPE, and lengths.
 
-Both encodings are versioned and length-delimited. V1 hits only when the physical key matches a `COMMITTED` block. A different physical key with the same logical key is an incompatible miss. Partial-prefix reuse is not implemented; a shorter chain is a different key.
+Both encodings are versioned and length-delimited. An exact hit requires the physical key and a `COMMITTED` block. A different physical key with the same logical key is an incompatible miss.
+
+A longer hash chain can return `PrefixHit` for a committed block whose chain is a strict prefix, when layout and the other byte-affecting fields match. That hit is the whole stored block. See [adr/0003-partial-prefix.md](adr/0003-partial-prefix.md). The store does not slice a block down to a shorter `valid_length`.
 
 ## Lifecycle
 
@@ -43,14 +50,18 @@ ABSENT -> RESERVED -> WRITING -> COMMITTED -> EVICTING -> ABSENT
                   \-> ABSENT (no buffer was registered)
 ```
 
-`COMMITTED` is the only readable state, and only when the stored checksum still matches the bytes. `Get` of anything else returns an error and no payload. `Lookup` returns a miss reason and no payload.
+`COMMITTED` is the only readable state, and only when the stored checksum still matches the bytes. `Get` of anything else returns an error and no payload. `Lookup` returns a hit, a whole-block `PrefixHit`, or a miss reason. It does not return payload bytes.
 
 `QUARANTINED` means a registered region might still be in use. Timeout, lease expiry, and `KnownIdle` do not free it. Reclaim requires either `Attestation::Drained` from an authorized tenant caller, or `bump_epoch` plus `reclaim_fenced` with the new epoch. Region ids are monotonic and are not recycled.
 
 ## Quotas
 
-`ResourceLimits` bounds object size, in-flight requests, registrations (including committed and quarantined buffers), per-tenant in-flight bytes, global retained bytes, and per-tenant retained bytes. The idempotency table is capped and entries expire. Over-capacity admission fails; V1 A does not silently evict a committed block to make room. `Invalidate` is the explicit eviction path.
+`ResourceLimits` bounds object size, in-flight requests, registrations (including committed and quarantined buffers), per-tenant in-flight bytes, global retained bytes, and per-tenant retained bytes. The idempotency table is capped and entries expire. `MemoryStore` still refuses admission instead of evicting. `FileStore` evicts the oldest unpinned committed block when a retained-byte quota would fail. It does not evict another tenant to satisfy a tenant quota, and it does not evict a pinned or quarantined block. `Invalidate` remains the explicit client path.
 
 ## Process model
 
-`MemoryStore` is single-threaded and in-process. The cross-process test exports a committed frame and runs `kv-block-xfer` in a child, which imports through the same public API. That is a wire-format check, not a network service. TCP is V1 B.
+`MemoryStore` is single-threaded and in-process. The cross-process test exports a committed frame and runs `kv-block-xfer` in a child. The TCP service is a thread per connection with one mutex around `FileStore`. The read-buffer pool is bounded. Restart reloads committed files, bumps the epoch, and drops in-flight reservations. A corrupt file is skipped and is not a hit.
+
+## Cold tier
+
+`gpucache-cold` packs several blocks into one object and a manifest of payload offsets. Put, Head, RangeGet, and Delete are a trait. The mock implements them in memory. A live HTTP client runs only when the operator sets `GPUCACHE_RUSTFS_*`. Transport does not depend on this crate.

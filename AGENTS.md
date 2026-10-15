@@ -4,7 +4,7 @@ GPUCache is the G3.5 shared KV tier. RustFS is the colder G4 backend. Read [READ
 
 ## Phase
 
-The active phase is **V1 milestone A** unless a human explicitly starts a later milestone. Do not implement V1 B, V2 RDMA, or V3 DPU work in a V1 A change. Do not publish crates, cut releases, deploy, or edit a website unless asked.
+The active phase is **V1 milestone B**. Do not implement V1 C, V2 RDMA, or V3 DPU work in a V1 B change. Do not publish crates, cut releases, deploy, or edit a website unless asked.
 
 ## Honesty rules
 
@@ -21,8 +21,10 @@ The active phase is **V1 milestone A** unless a human explicitly starts a later 
 | `gpucache-core-types` | `sha2` only |
 | `gpucache-protocol` | `gpucache-core-types` |
 | `gpucache-storage` | the two crates above |
+| `gpucache-transport` | the three crates above. TCP only |
+| `gpucache-cold` | `gpucache-core-types` and `sha2`. Not a dependency of storage or transport |
 
-No crate may add CUDA, DOCA, NIXL, RDMA, SPDK, erasure coding, or replica placement. `unsafe` is forbidden. Registered buffers whose completion is unknown stay quarantined until drain or a newer epoch; do not free them only because a lease timer fired.
+No crate may add CUDA, DOCA, NIXL, RDMA, SPDK, erasure coding, or replica placement. `unsafe` is forbidden. Registered buffers whose completion is unknown stay quarantined until drain or a newer epoch; do not free them only because a lease timer fired. The cold crate stays off the hot path.
 
 ## Checks
 

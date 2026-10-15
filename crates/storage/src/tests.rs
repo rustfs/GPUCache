@@ -744,6 +744,92 @@ fn request_deadline_is_enforced() {
     assert_eq!(store.stats().retained_bytes, 0);
 }
 
+#[test]
+fn partial_prefix_returns_the_whole_shorter_block_and_does_not_slice() {
+    let (mut store, auth) = open(None);
+    let payload = b"prefix-block".to_vec();
+    let generation = commit_bytes(&mut store, &auth, 10, &payload);
+    let mut longer = synthetic_identity(1, 1);
+    longer
+        .prefix_chain
+        .push(gpucache_core_types::Digest([0xab; 32]));
+    let looked = store
+        .lookup(
+            &auth,
+            0,
+            vec![LookupItem {
+                header: hdr(&store, 30, 0),
+                identity: longer.clone(),
+            }],
+        )
+        .unwrap();
+    match looked.items[0].body.clone().unwrap() {
+        LookupOutcome::PrefixHit {
+            generation: got_generation,
+            matched_prefix_blocks,
+            valid_length,
+            length,
+            ..
+        } => {
+            assert_eq!(got_generation, generation);
+            assert_eq!(matched_prefix_blocks, 1);
+            assert_eq!(length, payload.len() as u64);
+            let matched = gpucache_protocol::identity_for_prefix_hit(
+                &longer,
+                valid_length,
+                matched_prefix_blocks,
+            )
+            .unwrap();
+            assert_eq!(matched, synthetic_identity(1, 1));
+            let fetched = store
+                .get(
+                    &auth,
+                    0,
+                    vec![GetItem {
+                        header: hdr(&store, 31, 0),
+                        generation,
+                        identity: matched,
+                        pin_ttl_ms: 100,
+                    }],
+                )
+                .unwrap();
+            assert_eq!(fetched.items[0].body.as_ref().unwrap().payload, payload);
+            let wrong = store
+                .get(
+                    &auth,
+                    0,
+                    vec![GetItem {
+                        header: hdr(&store, 32, 0),
+                        generation,
+                        identity: longer,
+                        pin_ttl_ms: 100,
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(wrong.items[0].body, Err(CacheError::Incompatible)));
+        }
+        other => panic!("expected a whole-block prefix hit, got {other:?}"),
+    }
+    let mut sliced = synthetic_identity(1, 1);
+    sliced.valid_length = 4;
+    let slice_lookup = store
+        .lookup(
+            &auth,
+            0,
+            vec![LookupItem {
+                header: hdr(&store, 33, 0),
+                identity: sliced,
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        slice_lookup.items[0].body.as_ref().unwrap(),
+        LookupOutcome::Miss {
+            reason: gpucache_protocol::MissReason::Incompatible
+        }
+    ));
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

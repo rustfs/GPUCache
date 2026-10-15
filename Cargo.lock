@@ -148,6 +148,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpucache-dpu"
+version = "0.1.0"
+dependencies = [
+ "gpucache-core-types",
+]
+
+[[package]]
 name = "gpucache-protocol"
 version = "0.1.0"
 dependencies = [

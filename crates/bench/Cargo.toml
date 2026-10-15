@@ -12,5 +12,9 @@ publish = false
 name = "paired-baseline"
 path = "src/bin/paired_baseline.rs"
 
+[[bin]]
+name = "v3-paired"
+path = "src/bin/v3_paired.rs"
+
 [lints]
 workspace = true

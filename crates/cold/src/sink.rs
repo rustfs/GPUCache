@@ -32,8 +32,12 @@ impl ColdJob {
         }
     }
 
-    fn weight(&self) -> u64 {
+    pub fn byte_weight(&self) -> u64 {
         self.object_bytes.len() as u64 + self.manifest_bytes.len() as u64
+    }
+
+    fn weight(&self) -> u64 {
+        self.byte_weight()
     }
 }
 

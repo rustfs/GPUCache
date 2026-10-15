@@ -3,13 +3,15 @@
 //! Batch messages, deadlines, and wire-version negotiation for GPUCache.
 //!
 //! V1 A defined the request frames. V1 B adds reply frames and a TCP listener
-//! in `gpucache-transport`. Nothing here depends on a GPU, RDMA stack, or DPU.
+//! in `gpucache-transport`. V3 adds CPU authz, replay, seal, and rotation
+//! hooks. Nothing here depends on a GPU, RDMA stack, or DPU.
 
 #![forbid(unsafe_code)]
 
 mod api;
 mod auth;
 mod codec;
+mod harden;
 mod negotiate;
 mod reply;
 
@@ -27,6 +29,10 @@ pub use codec::{
     encode_hello_ack, encode_request, ensure_deadline, request_op, CommittedExport, EXPORT_VERSION,
     OP_COMMIT, OP_GET, OP_HELLO, OP_HELLO_ACK, OP_INVALIDATE, OP_LOOKUP, OP_RELEASE, OP_RESERVE,
     WIRE_MAGIC,
+};
+pub use harden::{
+    authorize_request, open_seal, seal, Acl, AuditEvent, IntegritySeal, ReplayGuard, RequestStamp,
+    SecretRing, SecurityLog,
 };
 pub use negotiate::{negotiate, HELLO_OP, WIRE_VERSION};
 pub use reply::{decode_reply, encode_reply, ReplyBody, REPLY_MAGIC};

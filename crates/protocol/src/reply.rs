@@ -490,6 +490,7 @@ fn quota_byte(kind: QuotaKind) -> u8 {
         QuotaKind::BatchItems => 5,
         QuotaKind::IdempotencyTable => 6,
         QuotaKind::PrefixLinks => 7,
+        QuotaKind::RateLimit => 8,
     }
 }
 
@@ -503,6 +504,7 @@ fn read_quota(value: u8) -> Result<QuotaKind, CacheError> {
         5 => QuotaKind::BatchItems,
         6 => QuotaKind::IdempotencyTable,
         7 => QuotaKind::PrefixLinks,
+        8 => QuotaKind::RateLimit,
         _ => {
             return Err(CacheError::Malformed {
                 reason: "quota kind",

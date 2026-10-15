@@ -12,6 +12,7 @@
 mod demo;
 mod http;
 mod mock;
+mod ops;
 mod pack;
 mod sigv4;
 mod sink;
@@ -19,8 +20,12 @@ mod sink;
 pub use demo::{run_cold_demo, ColdReport};
 pub use http::{live_probe, ProbeReport, ProbeStatus};
 pub use mock::MockObjectStore;
+pub use ops::{
+    enqueue_backfill, refill_degraded, verify_deleted, BackfillLimit, ColdAvailability, ColdKeys,
+    ColdOps, ObjectRecord, ReclaimStep, Retention,
+};
 pub use pack::{
-    contract_smoke, pack_blocks, read_manifest, Manifest, ObjectMeta, ObjectStore, PackedBlock,
-    PayloadRange,
+    contract_smoke, manifest_version, pack_blocks, read_manifest, Manifest, ObjectMeta,
+    ObjectStore, PackedBlock, PayloadRange, MANIFEST_VERSION,
 };
 pub use sink::{refill_generation, AsyncSink, ColdJob, RefillBudget, RefillOutcome};

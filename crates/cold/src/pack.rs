@@ -8,7 +8,9 @@ use gpucache_core_types::{
 
 const OBJECT_MAGIC: &[u8; 4] = b"GPKG";
 const MANIFEST_MAGIC: &[u8; 4] = b"GPMF";
-const VERSION: u16 = 1;
+const OBJECT_VERSION: u16 = 1;
+/// Manifest layout this crate will read. Any other version is a miss.
+pub const MANIFEST_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -77,7 +79,7 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
     }
     let mut object = ByteWriter::with_capacity(64);
     object.raw(OBJECT_MAGIC);
-    object.u16(VERSION);
+    object.u16(OBJECT_VERSION);
     object.u32(u32::try_from(records.len()).unwrap_or(u32::MAX));
     let mut ranges = Vec::with_capacity(records.len());
     for (block, identity) in &records {
@@ -99,7 +101,7 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
     let manifest_key = format!("{namespace}/manifest");
     let mut manifest = ByteWriter::with_capacity(64);
     manifest.raw(MANIFEST_MAGIC);
-    manifest.u16(VERSION);
+    manifest.u16(MANIFEST_VERSION);
     manifest.raw(&object_checksum.0);
     manifest.bytes(object_key.as_bytes())?;
     manifest.u32(u32::try_from(ranges.len()).unwrap_or(u32::MAX));
@@ -173,10 +175,23 @@ fn sample_blocks() -> Result<Vec<PackedBlock>, CacheError> {
     Ok(out)
 }
 
+/// Read the manifest version. A version other than [`MANIFEST_VERSION`] is
+/// not a hit; [`read_manifest`] rejects it.
+pub fn manifest_version(bytes: &[u8]) -> Result<u16, CacheError> {
+    let mut r = ByteReader::new(bytes);
+    let magic = r.raw(4)?;
+    if magic != MANIFEST_MAGIC {
+        return Err(CacheError::Storage {
+            reason: "store corrupt",
+        });
+    }
+    r.u16()
+}
+
 pub fn read_manifest(bytes: &[u8]) -> Result<Manifest, CacheError> {
     let mut r = ByteReader::new(bytes);
     let magic = r.raw(4)?;
-    if magic != MANIFEST_MAGIC || r.u16()? != VERSION {
+    if magic != MANIFEST_MAGIC || r.u16()? != MANIFEST_VERSION {
         return Err(CacheError::Storage {
             reason: "store corrupt",
         });
@@ -236,5 +251,25 @@ mod tests {
     fn mock_put_head_range_get_delete() {
         let mut store = MockObjectStore::default();
         contract_smoke(&mut store).unwrap();
+    }
+
+    #[test]
+    fn unknown_manifest_version_is_not_a_hit() {
+        let blocks = sample_blocks().unwrap();
+        let pack = pack_blocks("ver", &blocks).unwrap();
+        assert_eq!(
+            manifest_version(&pack.manifest_bytes).unwrap(),
+            MANIFEST_VERSION
+        );
+        let mut bad = pack.manifest_bytes.clone();
+        bad[4] = 2;
+        bad[5] = 0;
+        assert_eq!(manifest_version(&bad).unwrap(), 2);
+        assert!(matches!(
+            read_manifest(&bad),
+            Err(CacheError::Storage {
+                reason: "store corrupt"
+            })
+        ));
     }
 }

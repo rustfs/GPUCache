@@ -145,6 +145,12 @@ impl ShardDirectory {
         self.flights.len()
     }
 
+    /// Drop in-flight fills and bump the epoch. Credits return to the pool.
+    /// Callers must treat the dropped fills as misses. This is not a copy.
+    pub fn fence_epoch(&mut self) -> u64 {
+        self.fence_inflight()
+    }
+
     pub fn check_epoch(&self, request_epoch: u64) -> Result<(), CacheError> {
         if request_epoch != self.epoch {
             return Err(CacheError::EpochMismatch {

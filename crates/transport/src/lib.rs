@@ -16,7 +16,9 @@ mod directory;
 mod fault_demo;
 mod frame;
 mod iface;
+mod plane;
 mod pool;
+mod rate;
 mod registered;
 mod server;
 mod shard_demo;
@@ -30,6 +32,8 @@ pub use iface::{
     rdma_feature_selected, rdma_probe, HardwarePath, KvTransport, NixlTransport, TcpTransport,
     TransferDesc, TransferReceipt, TransportKind,
 };
+pub use plane::{ControlPlane, RebalancePlan, UpgradeStamp};
+pub use rate::RateGate;
 pub use registered::{CheckedBatch, PoolStats, RegisteredPool, SimCompletion, SlotId};
 pub use server::{serve, ServerConfig, ServerHandle};
 pub use shard_demo::{run_shard_demo, ShardReport};

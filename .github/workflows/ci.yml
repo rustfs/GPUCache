@@ -28,8 +28,14 @@ jobs:
         run: |
           cargo run -p gpucache-transport --bin shard-demo --quiet
           cargo run -p gpucache-cold --bin cold-demo --quiet
+      - name: V3 DPU contract and paired gate
+        run: |
+          cargo run -p gpucache-dpu --bin dpu-demo --quiet
+          cargo run -p gpucache-bench --bin v3-paired --quiet
       - name: Optional RDMA feature still skips hardware
         run: cargo test -p gpucache-transport --all-targets --features rdma-nixl
+      - name: Optional DPU feature still skips hardware
+        run: cargo test -p gpucache-dpu --all-targets --features dpu-bf3
       - name: Reject accelerator linkage and erasure coding
         run: |
           python3 - <<'PY'
@@ -60,6 +66,10 @@ jobs:
         run: |
           if grep -n 'gpucache-cold' crates/storage/Cargo.toml crates/transport/Cargo.toml crates/protocol/Cargo.toml crates/core-types/Cargo.toml; then
             echo "RustFS cold tier must not be a hot-path dependency"
+            exit 1
+          fi
+          if grep -n 'gpucache-dpu' crates/storage/Cargo.toml crates/transport/Cargo.toml crates/protocol/Cargo.toml crates/core-types/Cargo.toml crates/cold/Cargo.toml; then
+            echo "DPU crate must stay off the hot path and off the cold crate"
             exit 1
           fi
 

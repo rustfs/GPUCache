@@ -1,4 +1,4 @@
-# Operations (V1 B)
+# Operations (V1 C)
 
 V1 B is a library, an import helper, and a localhost TCP service. There is no package and no production config. The service creates files only under the directory you pass. It does not format NVMe, change a NIC, or touch a DPU.
 
@@ -27,6 +27,22 @@ cargo run -p gpucache-transport --bin share-demo
 ```
 
 This starts a loopback server on an ephemeral port, writes one synthetic block from one client, and reads it from a second client. Success is `status=REUSE_OK`. `partial_prefix=WHOLE_BLOCK_PREFIX` means the longer chain reused the whole shorter block. `intra_block_slice=DEGRADED_MISS` means a shorter `valid_length` was not sliced out of that block.
+
+## Hit, miss, and fallback
+
+```bash
+cargo run -p gpucache-transport --bin fault-demo
+```
+
+The command uses a fresh temp directory. It commits a synthetic token block, reads it back from a second client, and checks the token ids exactly. An unknown key, a corrupt file after restart, a past deadline, a cancel, and a quota refusal all fail closed. The caller recomputes with the same pure function of those token ids. `status=FALLBACK_OK` is printed only after those checks. `tolerance=NONE` means no numeric slack was applied. A wrong tenant, model, tokenizer, adapter, or layout is not a hit.
+
+The paired-baseline stub does not measure anything:
+
+```bash
+cargo run -p gpucache-bench --bin paired-baseline
+```
+
+`status=NOT_RUN_HARDWARE` is the honest result until a GPU run exists. See [BENCHMARKS.md](BENCHMARKS.md) and [CORRECTNESS.md](CORRECTNESS.md).
 
 ## TCP service
 

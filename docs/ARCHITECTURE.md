@@ -1,4 +1,4 @@
-# Architecture (V1 B)
+# Architecture (V1 C)
 
 GPUCache is a shared KV data tier. The hot tier is G3.5. RustFS is an optional colder G4 capacity tier. It is not on the prefill-to-decode path. The inference engine still owns tokenization, attention, and scheduling. This repo does not replace them.
 
@@ -21,11 +21,11 @@ gpucache-core-types  (identity, keys, lifecycle, errors)
 gpucache-cold        optional G4 pack/manifest. Not linked by transport.
 ```
 
-`MemoryStore` remains the in-process contract. `FileStore` is what the TCP service uses. Planned crates still absent: a standalone metadata service, an engine adapter, a DPU agent, a bench harness, and metrics. Their contracts stay out of `core-types` so GPU and DPU types do not leak in.
+`MemoryStore` remains the in-process contract. `FileStore` is what the TCP service uses. `gpucache-bench` only names the paired baselines and prints `NOT_RUN_HARDWARE`. Planned crates still absent: a standalone metadata service, an engine adapter, a DPU agent, and metrics. Their contracts stay out of `core-types` so GPU and DPU types do not leak in.
 
 ## Durability
 
-The hot tier does not repair lost blocks. There is no erasure coding and no replica set. Loss, corruption, eviction, and a failed check are clean misses. The engine recomputes and may write the block again. An extra copy of a hot shared prefix is a possible later latency optimization, not a durability feature, and it is not in this tree. Cold durability is RustFS's responsibility. See [adr/0002-no-erasure-coding.md](adr/0002-no-erasure-coding.md).
+The hot tier does not repair lost blocks. There is no erasure coding and no replica set. Loss, corruption, a short write, a full disk, eviction, and a failed check are clean misses. The engine recomputes and may write the block again. If the directory write fails after the in-memory commit, that commit is abandoned and the request id is forgotten, so a replay cannot report success for bytes that were not stored. An extra copy of a hot shared prefix is a possible later latency optimization, not a durability feature, and it is not in this tree. Cold durability is RustFS's responsibility. See [adr/0002-no-erasure-coding.md](adr/0002-no-erasure-coding.md).
 
 ## Identity
 
@@ -60,7 +60,7 @@ ABSENT -> RESERVED -> WRITING -> COMMITTED -> EVICTING -> ABSENT
 
 ## Process model
 
-`MemoryStore` is single-threaded and in-process. The cross-process test exports a committed frame and runs `kv-block-xfer` in a child. The TCP service is a thread per connection with one mutex around `FileStore`. The read-buffer pool is bounded. Restart reloads committed files, bumps the epoch, and drops in-flight reservations. A corrupt file is skipped and is not a hit.
+`MemoryStore` is single-threaded and in-process. The cross-process test exports a committed frame and runs `kv-block-xfer` in a child. The TCP service is a thread per connection with one mutex around `FileStore`. The read-buffer pool is bounded. Restart reloads committed files, bumps the epoch, and drops in-flight reservations. A corrupt or truncated file is skipped and is not a hit. A client that keeps talking to a stopped listener gets a transport error and must recompute; it does not keep a stale hit.
 
 ## Cold tier
 

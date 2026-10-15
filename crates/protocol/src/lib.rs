@@ -13,6 +13,9 @@ mod codec;
 mod negotiate;
 mod reply;
 
+#[cfg(test)]
+mod fuzz;
+
 pub use api::{
     identity_for_prefix_hit, BatchReply, CommitItem, CommitOutcome, GetHit, GetItem,
     InvalidateItem, InvalidateOutcome, ItemHeader, ItemResult, LookupItem, LookupOutcome,

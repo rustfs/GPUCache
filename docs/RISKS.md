@@ -1,4 +1,4 @@
-# Risks (V1 B)
+# Risks (V1 C)
 
 | Risk | Status | Note |
 | --- | --- | --- |
@@ -17,5 +17,9 @@
 | License of a future DOCA or model stack | `NOT_RUN_LICENSE` | No DOCA binary and no model weights are in the tree. |
 | GPU rental or DPU purchase | `NOT_RUN_BUDGET` | No paid API, GPU, or DPU was used. |
 | Hot block loss | Accepted | No erasure coding and no durability replicas. The outcome is a clean miss, then recompute and repopulate. Cold durability is RustFS G4. See ADR 0002. |
+| Short write or disk full reported as a durable hit | Mitigated | The in-memory commit is abandoned and the request id is forgotten. See `docs/V1C_TEST_MATRIX.md` |
+| Hostile protocol bytes | Mitigated by decoder fuzz | `proptest` inside `cargo test`. Not a multi-hour libFuzzer run |
+| Wrong model or tokenizer hit | Mitigated | Those identities miss. Comparison of synthetic tokens is exact. `tolerance=NONE` |
+| Invented baseline numbers | Closed in this tree | `paired-baseline` prints `NOT_RUN_HARDWARE` and contains no digits |
 
 Minimum reproduction of the CPU contract is `cargo test --workspace --all-targets`. There is no hardware failure log because the hardware was not present.

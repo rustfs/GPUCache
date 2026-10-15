@@ -11,10 +11,12 @@
 mod client;
 mod clock;
 mod demo;
+mod fault_demo;
 mod frame;
 mod pool;
 mod server;
 
 pub use client::TcpClient;
 pub use demo::{run_share_demo, ShareReport};
+pub use fault_demo::{run_fault_demo, FaultReport};
 pub use server::{serve, ServerConfig, ServerHandle};

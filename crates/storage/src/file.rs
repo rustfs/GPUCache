@@ -29,17 +29,32 @@ const BLOCK_VERSION: u16 = 1;
 const LRU_MAGIC: &[u8; 4] = b"GLRU";
 const LRU_VERSION: u16 = 1;
 
+/// Injected failure for the next durable block write. Production callers leave
+/// this unset. It exists so tests can force a short write or a full volume
+/// without filling the host disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistFault {
+    DiskFull,
+    ShortWrite,
+}
+
 /// Directory-backed store used by the V1 B TCP service.
 ///
 /// Admission evicts the least-recently-used unpinned `COMMITTED` block when a
 /// tenant or global retained-byte quota would otherwise fail. Pinned,
 /// quarantined, and in-flight blocks are not evicted. `MemoryStore` itself
 /// still refuses admission without evicting; only this backend reclaims.
+///
+/// A failed durable write is not a hit. The in-memory commit is abandoned and
+/// the request id is forgotten, so a replay cannot report success for bytes
+/// that never reached the directory.
 pub struct FileStore {
     root: PathBuf,
     inner: MemoryStore,
     lru: VecDeque<u64>,
     skipped_corrupt: u32,
+    fault: Option<PersistFault>,
+    fault_remaining: u32,
 }
 
 impl FileStore {
@@ -68,6 +83,8 @@ impl FileStore {
             inner,
             lru: order,
             skipped_corrupt,
+            fault: None,
+            fault_remaining: 0,
         };
         store.write_manifest()?;
         store.write_lru()?;
@@ -92,6 +109,17 @@ impl FileStore {
 
     pub fn skipped_corrupt(&self) -> u32 {
         self.skipped_corrupt
+    }
+
+    /// Fail the next `times` committed-block writes. `times == 0` clears the hook.
+    pub fn inject_persist_fault(&mut self, fault: PersistFault, times: u32) {
+        if times == 0 {
+            self.fault = None;
+            self.fault_remaining = 0;
+            return;
+        }
+        self.fault = Some(fault);
+        self.fault_remaining = times;
     }
 
     pub fn committed_path(&self, generation: u64) -> PathBuf {
@@ -158,7 +186,17 @@ impl FileStore {
                         self.touch(outcome.generation);
                         Ok(outcome)
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        let _ = self.inner.abandon_durable_commit(
+                            outcome.generation,
+                            request_id,
+                            now_ms,
+                        );
+                        self.delete_block(outcome.generation);
+                        self.lru
+                            .retain(|generation_in_lru| *generation_in_lru != outcome.generation);
+                        Err(err)
+                    }
                 },
                 Err(err) => Err(err),
             };
@@ -292,7 +330,16 @@ impl FileStore {
         let block = self.inner.export_committed(generation)?;
         let bytes = encode_block(&block)?;
         let path = block_path(&self.root, generation);
-        write_atomic(&path, &bytes)
+        write_atomic(&path, &bytes, self.take_fault())
+    }
+
+    fn take_fault(&mut self) -> Option<PersistFault> {
+        let fault = self.fault?;
+        self.fault_remaining = self.fault_remaining.saturating_sub(1);
+        if self.fault_remaining == 0 {
+            self.fault = None;
+        }
+        Some(fault)
     }
 
     fn touch(&mut self, generation: u64) {
@@ -313,7 +360,7 @@ impl FileStore {
         w.raw(MANIFEST_MAGIC);
         w.u16(MANIFEST_VERSION);
         w.u64(self.inner.epoch());
-        write_atomic(&self.root.join("MANIFEST"), &w.finish())
+        write_atomic(&self.root.join("MANIFEST"), &w.finish(), None)
     }
 
     fn write_lru(&self) -> Result<(), CacheError> {
@@ -325,7 +372,7 @@ impl FileStore {
         for generation in &self.lru {
             w.u64(*generation);
         }
-        write_atomic(&self.root.join("LRU"), &w.finish())
+        write_atomic(&self.root.join("LRU"), &w.finish(), None)
     }
 }
 
@@ -591,21 +638,83 @@ fn read_capped(path: &Path, max: usize) -> Result<Vec<u8>, CacheError> {
     Ok(buf)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file =
-            File::create(&tmp).map_err(|_| CacheError::Storage { reason: "store io" })?;
-        file.write_all(bytes)
-            .map_err(|_| CacheError::Storage { reason: "store io" })?;
-        file.sync_all()
-            .map_err(|_| CacheError::Storage { reason: "store io" })?;
+fn classify_store_io(err: &std::io::Error) -> CacheError {
+    if err.kind() == std::io::ErrorKind::StorageFull || err.raw_os_error() == Some(28) {
+        CacheError::Storage {
+            reason: "disk full",
+        }
+    } else {
+        CacheError::Storage { reason: "store io" }
     }
-    fs::rename(&tmp, path).map_err(|_| CacheError::Storage { reason: "store io" })?;
+}
+
+fn write_atomic(path: &Path, bytes: &[u8], fault: Option<PersistFault>) -> Result<(), CacheError> {
+    if matches!(fault, Some(PersistFault::DiskFull)) {
+        return Err(CacheError::Storage {
+            reason: "disk full",
+        });
+    }
+    let tmp = path.with_extension("tmp");
+    let result = write_temp(&tmp, bytes, fault);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return result;
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(classify_store_io(&err));
+    }
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();
         }
     }
     Ok(())
+}
+
+fn write_temp(tmp: &Path, bytes: &[u8], fault: Option<PersistFault>) -> Result<(), CacheError> {
+    let mut file = File::create(tmp).map_err(|err| classify_store_io(&err))?;
+    let slice = if matches!(fault, Some(PersistFault::ShortWrite)) {
+        &bytes[..bytes.len() / 2]
+    } else {
+        bytes
+    };
+    file.write_all(slice)
+        .map_err(|err| classify_store_io(&err))?;
+    file.sync_all().map_err(|err| classify_store_io(&err))?;
+    if matches!(fault, Some(PersistFault::ShortWrite)) {
+        return Err(CacheError::Storage {
+            reason: "short write",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod io_class_tests {
+    use super::classify_store_io;
+    use gpucache_core_types::CacheError;
+
+    #[test]
+    fn storage_full_and_enospc_map_to_disk_full() {
+        let full = std::io::Error::new(std::io::ErrorKind::StorageFull, "full");
+        assert_eq!(
+            classify_store_io(&full),
+            CacheError::Storage {
+                reason: "disk full",
+            }
+        );
+        let enospc = std::io::Error::from_raw_os_error(28);
+        assert_eq!(
+            classify_store_io(&enospc),
+            CacheError::Storage {
+                reason: "disk full",
+            }
+        );
+        let other = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            classify_store_io(&other),
+            CacheError::Storage { reason: "store io" }
+        );
+    }
 }

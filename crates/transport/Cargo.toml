@@ -21,5 +21,9 @@ path = "src/bin/gpucache_tcp.rs"
 name = "share-demo"
 path = "src/bin/share_demo.rs"
 
+[[bin]]
+name = "fault-demo"
+path = "src/bin/fault_demo.rs"
+
 [lints]
 workspace = true

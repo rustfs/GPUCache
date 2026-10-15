@@ -508,6 +508,24 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Drop a committed block after the durable write failed.
+    ///
+    /// The client was already told the commit failed. A later lookup must miss,
+    /// and replaying the same request id must not report success.
+    pub(crate) fn abandon_durable_commit(
+        &mut self,
+        generation: u64,
+        request_id: RequestId,
+        now_ms: u64,
+    ) -> Result<(), CacheError> {
+        let state = self.force_evict_committed(generation, now_ms)?;
+        if state != BlockState::Absent {
+            return Err(CacheError::InUse { refs: 1 });
+        }
+        self.idem.remove(&request_id);
+        Ok(())
+    }
+
     pub(crate) fn export_committed(&self, generation: u64) -> Result<DurableBlock, CacheError> {
         let slot = self
             .slots

@@ -1,0 +1,16 @@
+[package]
+name = "gpucache-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Paired-baseline harness stubs. GPU rows stay NOT_RUN_HARDWARE. No accelerator dependencies."
+publish = false
+
+[[bin]]
+name = "paired-baseline"
+path = "src/bin/paired_baseline.rs"
+
+[lints]
+workspace = true

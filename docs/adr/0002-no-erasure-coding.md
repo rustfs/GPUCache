@@ -1,0 +1,28 @@
+# ADR 0002: The hot tier does not use erasure coding or replicas
+
+- Status: **Accepted**
+- Date: 2026-10-15
+- Milestone: V1 A
+
+## Context
+
+GPUCache is a shared KV-cache tier (G3.5). A block is recomputable accelerator state. RustFS is the colder G4 capacity backend, and durability for cold data belongs there.
+
+Hardware erasure coding on a DPU was considered because other storage systems use it. It is not part of this cache. Parity and replica maintenance would sit on the hit path of data the inference engine can rebuild. That is the wrong cost for a miss-tolerant tier.
+
+## Decision
+
+GPUCache does not implement erasure coding. It does not implement durability replicas.
+
+If a hot block is lost, corrupt, evicted, or fails a check, the result is a clean miss. The engine recomputes the block and may populate the cache again. There is no rebuild from parity.
+
+An extra copy of a hot shared prefix may be considered later as a latency optimization. That copy is not erasure coding, it is not a durability promise, and it is not implemented in V1 A.
+
+DOCA EC, SPDK RAID targets, and similar offloads are not GPUCache components. They must not reappear on the roadmap as cache features. A later BlueField data-path milestone is not an erasure-coding milestone.
+
+## Consequences
+
+- The README and roadmap do not list an EC milestone.
+- The V1 A crates have no EC types, no parity buffers, and no replica placement.
+- RustFS remains responsible for any durable cold object it is later asked to store. That client is not in V1 A.
+- A cache miss after a node loss is correct behavior. The KV block is not the user's only copy.

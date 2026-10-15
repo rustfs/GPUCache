@@ -1,0 +1,18 @@
+[package]
+name = "gpucache-core-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Versioned KV-cache identity, lifecycle, and error model. No GPU or DPU dependencies."
+publish = false
+
+[dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+proptest = "=1.4.0"
+
+[lints]
+workspace = true

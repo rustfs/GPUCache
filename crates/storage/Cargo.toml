@@ -1,0 +1,23 @@
+[package]
+name = "gpucache-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "In-process MemoryStore for the GPUCache V1 A contract. No GPU or DPU dependencies."
+publish = false
+
+[dependencies]
+gpucache-core-types.workspace = true
+gpucache-protocol.workspace = true
+
+[dev-dependencies]
+proptest = "=1.4.0"
+
+[[bin]]
+name = "kv-block-xfer"
+path = "src/bin/kv_block_xfer.rs"
+
+[lints]
+workspace = true

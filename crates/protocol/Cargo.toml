@@ -1,0 +1,18 @@
+[package]
+name = "gpucache-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Versioned batch protocol for the GPUCache shared KV tier. No GPU or DPU dependencies."
+publish = false
+
+[dependencies]
+gpucache-core-types.workspace = true
+
+[dev-dependencies]
+proptest = "=1.4.0"
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 # Third-party notices
 
-GPUCache V1 A is Apache-2.0. See [LICENSE](LICENSE).
+GPUCache V1 A and V1 B are Apache-2.0. See [LICENSE](LICENSE).
 
 Direct dependencies:
 

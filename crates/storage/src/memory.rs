@@ -90,6 +90,32 @@ pub struct ReclaimRequest {
     pub observed_epoch: u64,
 }
 
+/// Committed block image used by the file backend to reload after restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DurableBlock {
+    pub generation: u64,
+    pub identity: CacheIdentity,
+    pub checksum: Checksum,
+    pub payload: Vec<u8>,
+}
+
+/// A committed block the file backend may evict under quota pressure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EvictionCandidate {
+    pub generation: u64,
+    pub tenant: Vec<u8>,
+    pub length: u64,
+    pub pinned: bool,
+}
+
+struct PrefixChoice {
+    generation: u64,
+    chain_len: usize,
+    length: u64,
+    checksum: Checksum,
+    valid_length: u32,
+}
+
 /// Process-local shared KV store. Only `COMMITTED` compatible blocks are hits.
 pub struct MemoryStore {
     limits: ResourceLimits,
@@ -396,6 +422,224 @@ impl MemoryStore {
         Ok(self.reply(out))
     }
 
+    pub fn limits(&self) -> ResourceLimits {
+        self.limits
+    }
+
+    pub(crate) fn tenant_retained_bytes(&self, tenant: &[u8]) -> u64 {
+        self.tenant_retained.get(tenant).copied().unwrap_or(0)
+    }
+
+    /// Recovery only. The store must still be empty, and `epoch` must be non-zero.
+    pub(crate) fn restore_epoch(&mut self, epoch: u64) -> Result<(), CacheError> {
+        if epoch == 0 || !self.slots.is_empty() {
+            return Err(CacheError::Malformed {
+                reason: "restore epoch",
+            });
+        }
+        self.epoch = epoch;
+        Ok(())
+    }
+
+    /// Insert one checksum-valid committed block during process recovery.
+    ///
+    /// In-flight reservations are not restored. A block that fails its checksum
+    /// is not inserted and therefore cannot be a hit after restart.
+    pub(crate) fn restore_committed(&mut self, block: DurableBlock) -> Result<(), CacheError> {
+        if block.generation == 0 || self.slots.contains_key(&block.generation) {
+            return Err(CacheError::Malformed {
+                reason: "restore generation",
+            });
+        }
+        block.identity.validate(&self.identity_limits)?;
+        if block.payload.is_empty() {
+            return Err(CacheError::Malformed {
+                reason: "restore payload",
+            });
+        }
+        if block.payload.len() as u64 > self.limits.max_object_bytes {
+            return Err(CacheError::ObjectTooLarge {
+                limit: self.limits.max_object_bytes,
+                actual: block.payload.len() as u64,
+            });
+        }
+        verify_checksum(&block.payload, block.checksum)?;
+        let physical = encode_physical_key(&block.identity, &self.identity_limits)?;
+        let logical = encode_logical_key(&block.identity, &self.identity_limits)?;
+        if self.by_physical.contains_key(&physical) {
+            return Err(CacheError::InvalidTransition {
+                from: BlockState::Committed,
+                event: "restore",
+            });
+        }
+        let mut life = Lifecycle::absent();
+        life.apply(Event::Reserve)?;
+        life.apply(Event::BeginWrite)?;
+        life.apply(Event::Commit)?;
+        let length = block.payload.len() as u64;
+        let generation = block.generation;
+        let region_id = self.alloc_region();
+        self.slots.insert(
+            generation,
+            Slot {
+                identity: block.identity,
+                physical: physical.clone(),
+                logical: logical.clone(),
+                life,
+                length,
+                checksum: block.checksum,
+                bytes: Some(block.payload),
+                reserve_epoch: self.epoch,
+                lease_deadline_ms: u64::MAX,
+                region_id: Some(region_id),
+                pins: Vec::new(),
+                charges: Charges::NONE,
+                fail: None,
+            },
+        );
+        self.index_add(physical, logical, generation);
+        if generation >= self.next_generation {
+            self.next_generation = generation.saturating_add(1);
+        }
+        if let Err(err) = self.reconcile(generation) {
+            self.remove_slot(generation);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn export_committed(&self, generation: u64) -> Result<DurableBlock, CacheError> {
+        let slot = self
+            .slots
+            .get(&generation)
+            .ok_or(CacheError::UnknownGeneration)?;
+        if !slot.life.is_hit_visible() {
+            return Err(CacheError::NotExposed {
+                state: slot.life.state,
+            });
+        }
+        let payload = slot.bytes.clone().unwrap_or_default();
+        verify_checksum(&payload, slot.checksum)?;
+        Ok(DurableBlock {
+            generation,
+            identity: slot.identity.clone(),
+            checksum: slot.checksum,
+            payload,
+        })
+    }
+
+    pub(crate) fn eviction_candidates(&mut self, now_ms: u64) -> Vec<EvictionCandidate> {
+        self.poll(now_ms);
+        let mut out = Vec::new();
+        for (generation, slot) in &self.slots {
+            if !slot.life.is_hit_visible() {
+                continue;
+            }
+            out.push(EvictionCandidate {
+                generation: *generation,
+                tenant: slot.identity.tenant.as_bytes().to_vec(),
+                length: slot.length,
+                pinned: !slot.pins.is_empty() || slot.life.refs > 0,
+            });
+        }
+        out
+    }
+
+    /// Drop one unpinned committed block. Used by file-backend admission.
+    ///
+    /// Pinned, quarantined, and in-flight blocks are left in place. This is not
+    /// a client-facing invalidate and it does not consult the idempotency table.
+    pub(crate) fn force_evict_committed(
+        &mut self,
+        generation: u64,
+        now_ms: u64,
+    ) -> Result<BlockState, CacheError> {
+        self.poll(now_ms);
+        let slot = self
+            .slots
+            .get(&generation)
+            .ok_or(CacheError::UnknownGeneration)?;
+        if !slot.life.is_hit_visible() {
+            return Err(CacheError::NotExposed {
+                state: slot.life.state,
+            });
+        }
+        if !slot.pins.is_empty() || slot.life.refs > 0 {
+            return Err(CacheError::InUse {
+                refs: slot.life.refs.max(1),
+            });
+        }
+        self.apply_event(generation, Event::BeginEvict, None)?;
+        self.maybe_finish(generation)?;
+        Ok(self
+            .slots
+            .get(&generation)
+            .map(|slot| slot.life.state)
+            .unwrap_or(BlockState::Absent))
+    }
+
+    fn find_prefix_hit(
+        &mut self,
+        query: &CacheIdentity,
+    ) -> Result<Option<PrefixChoice>, CacheError> {
+        let generations: Vec<u64> = self.slots.keys().copied().collect();
+        let mut corrupt = Vec::new();
+        let mut best: Option<PrefixChoice> = None;
+        for generation in generations {
+            let Some(slot) = self.slots.get(&generation) else {
+                continue;
+            };
+            if slot.identity.tenant != query.tenant
+                || slot.identity.trust_domain != query.trust_domain
+            {
+                continue;
+            }
+            if !slot.life.is_hit_visible() {
+                continue;
+            }
+            let stored_len = slot.identity.prefix_chain.len();
+            let query_len = query.prefix_chain.len();
+            if stored_len == 0 || stored_len >= query_len {
+                continue;
+            }
+            if slot.identity.prefix_chain.as_slice() != &query.prefix_chain[..stored_len] {
+                continue;
+            }
+            if !layout_compatible(&slot.identity, query) {
+                continue;
+            }
+            let payload = slot.bytes.clone().unwrap_or_default();
+            if payload.len() as u64 != slot.length
+                || verify_checksum(&payload, slot.checksum).is_err()
+            {
+                corrupt.push(generation);
+                continue;
+            }
+            let choice = PrefixChoice {
+                generation,
+                chain_len: stored_len,
+                length: slot.length,
+                checksum: slot.checksum,
+                valid_length: slot.identity.valid_length,
+            };
+            let replace = match &best {
+                None => true,
+                Some(prev) => {
+                    choice.chain_len > prev.chain_len
+                        || (choice.chain_len == prev.chain_len
+                            && choice.generation > prev.generation)
+                }
+            };
+            if replace {
+                best = Some(choice);
+            }
+        }
+        for generation in corrupt {
+            let _ = self.apply_event(generation, Event::CorruptHold, Some(FailKind::Corrupt));
+        }
+        Ok(best)
+    }
+
     fn reply<T>(&self, items: Vec<ItemResult<T>>) -> BatchReply<T> {
         BatchReply {
             store_epoch: self.epoch,
@@ -463,6 +707,19 @@ impl MemoryStore {
             }
             return Ok(LookupOutcome::Miss {
                 reason: miss_reason(slot.life.state),
+            });
+        }
+        if let Some(choice) = self.find_prefix_hit(&item.identity)? {
+            let matched_prefix_blocks =
+                u32::try_from(choice.chain_len).map_err(|_| CacheError::Malformed {
+                    reason: "prefix length",
+                })?;
+            return Ok(LookupOutcome::PrefixHit {
+                generation: choice.generation,
+                length: choice.length,
+                checksum: choice.checksum,
+                valid_length: choice.valid_length,
+                matched_prefix_blocks,
             });
         }
         if self
@@ -1304,6 +1561,22 @@ impl MemoryStore {
         self.idem
             .retain(|_, record| now_ms.saturating_sub(record.inserted_ms) < ttl);
     }
+}
+
+fn layout_compatible(stored: &CacheIdentity, query: &CacheIdentity) -> bool {
+    stored.version == query.version
+        && stored.model_revision == query.model_revision
+        && stored.model_config_hash == query.model_config_hash
+        && stored.tokenizer_revision == query.tokenizer_revision
+        && stored.adapter == query.adapter
+        && stored.kv_dtype == query.kv_dtype
+        && stored.quant_format == query.quant_format
+        && stored.layout == query.layout
+        && stored.shard == query.shard
+        && stored.position == query.position
+        && stored.rope == query.rope
+        && stored.multimodal == query.multimodal
+        && stored.block_token_count == query.block_token_count
 }
 
 fn charge_target(state: BlockState) -> ChargeTarget {

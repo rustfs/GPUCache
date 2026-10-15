@@ -1,4 +1,4 @@
-# Risks (V1 A)
+# Risks (V1 B)
 
 | Risk | Status | Note |
 | --- | --- | --- |
@@ -8,7 +8,11 @@
 | Idempotency window expiry | Accepted | After TTL, a request id may run again. Callers must not reuse ids they still care about. |
 | `Drained` is only tenant-authenticated | Accepted for V1 A | Not a device proof. Documented in SECURITY.md. |
 | No real engine bytes | `NOT_RUN_HARDWARE` | Synthetic frames can pass while a real vLLM layout still mismatches. |
-| No TCP, NVMe, or RustFS | Not started | V1 B. A mock must not be described as a measured RustFS run. |
+| TCP exposure | Mitigated for the default bind | Loopback unless `--allow-remote`. Empty policy and bad fingerprints fail closed. No mTLS yet. |
+| File backend | Mitigated for the test directory | Ordinary files only. Device paths are rejected. A corrupt file is a miss after restart. |
+| LRU admission | Mitigated with a pin check | Unpinned committed blocks can be evicted. Pinned and quarantined blocks are not. After a missing `LRU` file, order falls back to ascending generation. |
+| Partial prefix | Documented in ADR 0003 | Whole-block prefix only. A client that ignores `matched_prefix_blocks` can mis-align. Intra-block slice is a miss. |
+| RustFS live probe | `NOT_RUN_HARDWARE` | Mock Put/Head/RangeGet/Delete passes. A mock is not a measured RustFS run. |
 | No RDMA / DPU measurement | `NOT_RUN_HARDWARE` | Do not infer a speedup from this milestone. |
 | License of a future DOCA or model stack | `NOT_RUN_LICENSE` | No DOCA binary and no model weights are in the tree. |
 | GPU rental or DPU purchase | `NOT_RUN_BUDGET` | No paid API, GPU, or DPU was used. |

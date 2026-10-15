@@ -1,6 +1,6 @@
 # Compatibility manifest
 
-Recorded for V1 milestone A. This file is not a performance acceptance report and not a hardware inventory of a BlueField node.
+Recorded for V1 milestones A and B. This file is not a performance acceptance report and not a hardware inventory of a BlueField node.
 
 | Component | Value | Result |
 | --- | --- | --- |
@@ -15,8 +15,9 @@ Recorded for V1 milestone A. This file is not a performance acceptance report an
 | LMCache | Not a dependency | `NOT_RUN_HARDWARE` (route undecided) |
 | NIXL / UCX / RDMA | Not a dependency | Not in V1 |
 | DOCA / BlueField BFB / firmware | Not present | `NOT_RUN_HARDWARE` |
-| RustFS server / client | No endpoint authorized | `NOT_RUN_HARDWARE` |
-| Direct Rust deps | `sha2` 0.10.8; dev `proptest` 1.4.0 | Apache-2.0 OR MIT; see `Cargo.lock` |
+| RustFS server / client | No endpoint authorized in this environment. Contract mock covers Put, Head, RangeGet, Delete, pack, and manifest | Live probe `NOT_RUN_HARDWARE`. Mock `PASS` |
+| TCP / file store | Loopback TCP and a temp directory on the build host | `PASS` for `cargo test --workspace --all-targets` on x86_64. Not an NVMe format and not a DPU run |
+| Direct Rust deps | `sha2` 0.10.8; dev `proptest` 1.4.0 | Apache-2.0 OR MIT; see `Cargo.lock`. No new direct crate in V1 B |
 | License of this repo | Apache-2.0 | See `LICENSE` |
 
 CI (see `.github/workflows/ci.yml`) builds and runs the same tests on x86_64 and on aarch64 (GitHub ARM runner, plus qemu-user cross execution). An aarch64 result is a CPU result. It does not certify BlueField-3, DOCA, or NVMe-on-DPU.

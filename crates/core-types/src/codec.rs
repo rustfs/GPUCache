@@ -63,6 +63,14 @@ impl ByteWriter {
     pub fn finish(self) -> Vec<u8> {
         self.buf
     }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
 }
 
 impl Default for ByteWriter {

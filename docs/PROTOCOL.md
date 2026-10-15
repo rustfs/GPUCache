@@ -1,6 +1,6 @@
 # Protocol (wire version 1)
 
-V1 A defines the messages. It does not open a socket. A later TCP listener must speak this framing unchanged.
+Request frames are unchanged from V1 A. V1 B adds reply frames and a TCP envelope. The TCP listener speaks the V1 A request framing as the envelope body.
 
 ## Framing
 
@@ -50,4 +50,22 @@ Request deadlines abort the call. Writer leases move `RESERVED` with no buffer b
 
 ## Compatibility
 
-A hit requires the physical key and a `COMMITTED` block. Logical-key overlap with a different layout, dtype, quant, or shard is a miss. V1 A does not assemble a partial prefix. Engines that need a shorter hit must ask again at V1 B, which must either implement a safe partial-prefix rule or keep whole-block hits.
+A hit requires the physical key and a `COMMITTED` block. Logical-key overlap with a different layout, dtype, quant, or shard is a miss.
+
+`PrefixHit` is a whole stored block whose hash chain is a strict prefix of the query and whose layout-affecting fields match. `matched_prefix_blocks` is the stored chain length. `Get` uses `identity_for_prefix_hit`. The same chain with a different `valid_length` is an incompatible miss: the service does not return a sliced payload. See [adr/0003-partial-prefix.md](adr/0003-partial-prefix.md).
+
+## Replies
+
+Reply magic is `GCKR`, version 1. `op` matches the request (`1` through `6`). `op` `0` is a batch-level failure and carries the request op, the store epoch, and an error code. Item status `1` is success and `0` is an item error. Lookup success tag `1` is an exact hit, `2` is `PrefixHit`, `3` is a miss. Static error strings are not on the wire; decoded remote errors use the reason `remote`.
+
+## TCP envelope
+
+Each TCP message is:
+
+| Field | Contents |
+| --- | --- |
+| payload_len | `u32` little-endian, includes the clock field |
+| server_now_ms | `u64` little-endian. Clients send `0`. The server sends its monotonic clock |
+| body | a `GCK1` request or hello, or a `GCKR` reply or hello ack |
+
+Deadlines are absolute on the server clock. `TcpClient` samples `server_now_ms` from the hello ack and from each reply. A length above the configured frame cap is rejected before the body is read. The server read-buffer pool does not grow past its capacity.

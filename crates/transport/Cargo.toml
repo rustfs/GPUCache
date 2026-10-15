@@ -1,0 +1,25 @@
+[package]
+name = "gpucache-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Localhost TCP transport for the GPUCache V1 B cache service. No RDMA or DPU dependencies."
+publish = false
+
+[dependencies]
+gpucache-core-types.workspace = true
+gpucache-protocol.workspace = true
+gpucache-storage.workspace = true
+
+[[bin]]
+name = "gpucache-tcp"
+path = "src/bin/gpucache_tcp.rs"
+
+[[bin]]
+name = "share-demo"
+path = "src/bin/share_demo.rs"
+
+[lints]
+workspace = true

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "In-process MemoryStore for the GPUCache V1 A contract. No GPU or DPU dependencies."
+description = "MemoryStore and file-backed store for the GPUCache V1 contract. No GPU or DPU dependencies."
 publish = false
 
 [dependencies]

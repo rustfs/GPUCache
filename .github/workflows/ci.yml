@@ -20,10 +20,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets
-      - name: Reject accelerator crates in V1 A
+      - name: Reject accelerator crates in V1
         run: |
           if grep -RInE 'cuda|doca|nixl|rdma|spdk' crates/*/Cargo.toml; then
-            echo "V1 A crates must not depend on GPU or DPU stacks"
+            echo "V1 crates must not depend on GPU or DPU stacks"
+            exit 1
+          fi
+      - name: Keep the cold tier off the hot path
+        run: |
+          if grep -n 'gpucache-cold' crates/storage/Cargo.toml crates/transport/Cargo.toml crates/protocol/Cargo.toml crates/core-types/Cargo.toml; then
+            echo "RustFS cold tier must not be a hot-path dependency"
             exit 1
           fi
 

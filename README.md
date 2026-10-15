@@ -4,6 +4,8 @@ GPUCache is an open shared KV-cache tier for disaggregated inference. In NVIDIA 
 
 A KV block is recomputable accelerator state. It is not the user's only copy of a prompt, and it is not model-agnostic long-term memory. A miss, timeout, checksum failure, version mismatch, or store outage must fall back to the inference engine and recompute. A wrong hit is a failure.
 
+GPUCache does not do erasure coding and does not keep durability replicas. A lost or failed hot block is a clean miss: the engine recomputes and may repopulate the cache. Durability for cold data is RustFS G4's job. An extra copy of a hot shared prefix may be added later as a latency hint; that copy is not erasure coding and it is not a durability promise. See [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md).
+
 ## Status
 
 **V1 milestone A is implemented. DPU acceleration is not.**
@@ -17,9 +19,10 @@ V1 runs the cache contract on CPU. The long-term deployment target is a storage-
 | V1 B: TCP service, file/NVMe, admission, RustFS smoke | Not started |
 | V1 C: fuzz, fault injection, engine output comparison, paired baselines | Not started |
 | V2: NIC RDMA (NIXL or Mooncake) plus a real RustFS cold path | Not started; blocked on V1 |
-| V3: BlueField-3 offload and production hardening | Not started; not purchased and not measured |
+| V3: BlueField-3 data-path offload and production hardening | Not started; not purchased and not measured. Not an erasure-coding milestone |
+| Erasure coding and durability replicas | Will not be built. A lost or failed hot block is a clean miss, then recompute and repopulate. Cold durability is RustFS G4 |
 
-The integration route (native vLLM KV connector or LMCache) is **not chosen**. See [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md).
+The integration route (native vLLM KV connector or LMCache) is **not chosen**. See [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md). Hot-tier failure policy is [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md).
 
 ## What V1 A does
 
@@ -59,7 +62,7 @@ That command is the CPU contract repro. It includes unit tests, property tests, 
 crates/core-types    identity, keys, lifecycle, errors
 crates/protocol      batch messages and version negotiation
 crates/storage       MemoryStore and kv-block-xfer
-docs/adr             integration-route decision record
+docs/adr             decision records (integration route, no erasure coding)
 COMPATIBILITY.md     environment manifest
 ```
 

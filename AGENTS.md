@@ -1,6 +1,6 @@
 # Agent notes
 
-GPUCache is the G3.5 shared KV tier. RustFS is the colder G4 backend. Read [README.md](README.md) and [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md) before changing scope.
+GPUCache is the G3.5 shared KV tier. RustFS is the colder G4 backend. Read [README.md](README.md), [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md), and [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md) before changing scope.
 
 ## Phase
 
@@ -11,6 +11,7 @@ The active phase is **V1 milestone A** unless a human explicitly starts a later 
 - Do not claim DPU, DOCA, RDMA, SPDK, or CUDA acceleration. V1 is CPU only. An aarch64 build is not a BlueField test.
 - Do not invent vLLM, LMCache, or NIXL results. A real engine KV export/import needs a GPU and stays `NOT_RUN_HARDWARE` until that run exists.
 - Do not treat a KV block as model-agnostic long-term memory. A miss falls back to recompute. A wrong-tenant or wrong-layout hit is a defect.
+- Do not add erasure coding, parity, or durability replicas. A lost or failed hot block is a clean miss, then recompute and repopulate. Cold durability belongs to RustFS. An extra hot-prefix copy, if it is ever added, is a latency hint and not a durability promise.
 - Docs in this repo are English.
 
 ## Crates
@@ -21,7 +22,7 @@ The active phase is **V1 milestone A** unless a human explicitly starts a later 
 | `gpucache-protocol` | `gpucache-core-types` |
 | `gpucache-storage` | the two crates above |
 
-No crate may add CUDA, DOCA, NIXL, RDMA, or SPDK. `unsafe` is forbidden. Registered buffers whose completion is unknown stay quarantined until drain or a newer epoch; do not free them only because a lease timer fired.
+No crate may add CUDA, DOCA, NIXL, RDMA, SPDK, erasure coding, or replica placement. `unsafe` is forbidden. Registered buffers whose completion is unknown stay quarantined until drain or a newer epoch; do not free them only because a lease timer fired.
 
 ## Checks
 

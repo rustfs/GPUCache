@@ -18,6 +18,10 @@ gpucache-core-types  (identity, keys, lifecycle, errors)
 
 Planned crates that are **not** in V1 A: `metadata` as a standalone service, `transport` (TCP), file/NVMe store, RustFS object store, engine adapter, DPU agent, bench harness, metrics. Their contracts are reserved so later milestones do not push GPU or DPU types into `core-types`.
 
+## Durability
+
+The hot tier does not repair lost blocks. There is no erasure coding and no replica set. Loss, corruption, eviction, and a failed check are clean misses. The engine recomputes and may write the block again. An extra copy of a hot shared prefix is a possible later latency optimization, not a durability feature, and it is not in this tree. Cold durability is RustFS's responsibility. See [adr/0002-no-erasure-coding.md](adr/0002-no-erasure-coding.md).
+
 ## Identity
 
 `CacheIdentity` is version 1. It carries tenant and trust domain, model revision, model-config digest, tokenizer revision, adapter/LoRA identity, KV dtype, quant format, layout ABI, TP/PP shard, position encoding, RoPE parameters (IEEE-754 bits), a token-prefix **hash** chain, block token capacity, valid length, and an optional multimodal processor/input digest.

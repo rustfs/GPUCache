@@ -128,6 +128,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpucache-bench"
+version = "0.1.0"
+
+[[package]]
 name = "gpucache-cold"
 version = "0.1.0"
 dependencies = [

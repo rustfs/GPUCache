@@ -10,10 +10,12 @@
 
 mod file;
 mod memory;
+mod synthetic;
 mod transfer;
 
-pub use file::FileStore;
+pub use file::{FileStore, PersistFault};
 pub use memory::{MemoryStore, ReclaimRequest, StoreStats};
+pub use synthetic::{decode_synthetic_kv, deterministic_recompute, encode_synthetic_kv};
 pub use transfer::{import_committed_block, ImportReport};
 
 #[cfg(test)]

@@ -52,6 +52,8 @@ Request deadlines abort the call. Writer leases move `RESERVED` with no buffer b
 
 A hit requires the physical key and a `COMMITTED` block. Logical-key overlap with a different layout, dtype, quant, or shard is a miss.
 
+A commit that arrives before its reserve is `UnknownGeneration` and returns no bytes. Two items in one batch that share a `request_id` are rejected before either runs. Replaying a successful commit with the same canonical arguments returns the stored result and does not create a second block. The same id with different arguments is `IdempotencyConflict`. Decoders reject truncated frames, a second frame glued on the end, and a frame whose halves were swapped. A declared length above the hard cap is rejected before the buffer is allocated.
+
 `PrefixHit` is a whole stored block whose hash chain is a strict prefix of the query and whose layout-affecting fields match. `matched_prefix_blocks` is the stored chain length. `Get` uses `identity_for_prefix_hit`. The same chain with a different `valid_length` is an incompatible miss: the service does not return a sliced payload. See [adr/0003-partial-prefix.md](adr/0003-partial-prefix.md).
 
 ## Replies

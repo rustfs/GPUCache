@@ -8,7 +8,7 @@ GPUCache does not do erasure coding and does not keep durability replicas. A los
 
 ## Status
 
-**V1 milestones A and B are implemented. DPU acceleration is not.**
+**V1 milestones A, B, and C are implemented. DPU acceleration is not.**
 
 V1 runs the cache contract on CPU. The long-term deployment target is a storage-side BlueField-3, but this repository does not link DOCA, CUDA, RDMA, or SPDK, and it does not claim that any of those paths exist. An aarch64 build is a CPU build. It is not a BlueField functional test.
 
@@ -18,7 +18,7 @@ V1 runs the cache contract on CPU. The long-term deployment target is a storage-
 | V1 A: real vLLM KV block export/import | `NOT_RUN_HARDWARE` (no GPU in this environment) |
 | V1 B: TCP service, file backend, LRU admission, tenant quotas, two-client reuse | Implemented in this tree |
 | V1 B: RustFS live Put/Head/RangeGet/Delete | `NOT_RUN_HARDWARE` (no authorized endpoint). Contract mock passes |
-| V1 C: fuzz, fault injection, engine output comparison, paired baselines | Not started |
+| V1 C: fuzz, fault injection, synthetic token checks, paired-baseline stubs | Implemented in this tree. Real engine output is `NOT_RUN_HARDWARE` |
 | V2: NIC RDMA (NIXL or Mooncake) plus a real RustFS cold path | Not started; blocked on V1 |
 | V3: BlueField-3 data-path offload and production hardening | Not started; not purchased and not measured. Not an erasure-coding milestone |
 | Erasure coding and durability replicas | Will not be built. A lost or failed hot block is a clean miss, then recompute and repopulate. Cold durability is RustFS G4 |
@@ -63,7 +63,7 @@ From a clean checkout, with Rust stable (MSRV 1.85):
 cargo test --workspace --all-targets
 ```
 
-That command is the CPU contract repro for V1 A and V1 B. It includes unit tests, property tests, timeout and cancel tests, a single-process import of a synthetic block, a cross-process import through `kv-block-xfer`, file-backend quota and restart tests, and the TCP reuse tests. The bytes are synthetic. They are not a vLLM KV tensor.
+That command is the CPU contract repro for V1 A, V1 B, and V1 C. It includes unit tests, property tests, protocol fuzz, timeout and cancel tests, a single-process import of a synthetic block, a cross-process import through `kv-block-xfer`, file-backend quota and restart tests, the TCP reuse tests, and the V1 C fault matrix. The bytes are synthetic. They are not a vLLM KV tensor.
 
 Two localhost clients sharing one file-backed service:
 
@@ -73,6 +73,20 @@ cargo run -p gpucache-transport --bin share-demo
 
 A successful run prints `status=REUSE_OK` and `partial_prefix=WHOLE_BLOCK_PREFIX`. It does not print a sliced-block hit.
 
+Hit, miss, and recompute fallback from a clean temp directory:
+
+```bash
+cargo run -p gpucache-transport --bin fault-demo
+```
+
+Success is `status=FALLBACK_OK` plus `criteria=EXACT_TOKEN_IDS` and `tolerance=NONE`. The process prints that banner only after the checks pass. A wrong tenant or wrong model is not a hit. This is not a vLLM run.
+
+Paired GPU baselines stay `NOT_RUN_HARDWARE` and print no timings:
+
+```bash
+cargo run -p gpucache-bench --bin paired-baseline
+```
+
 `kv-block-xfer import <credential-hex>` reads one export frame on stdin and imports it into a fresh `MemoryStore`. It does not talk to an engine.
 
 ## Layout
@@ -81,13 +95,14 @@ A successful run prints `status=REUSE_OK` and `partial_prefix=WHOLE_BLOCK_PREFIX
 crates/core-types    identity, keys, lifecycle, errors
 crates/protocol      batch messages, replies, version negotiation
 crates/storage       MemoryStore, FileStore, kv-block-xfer
-crates/transport     TCP server, client, share-demo
+crates/transport     TCP server, client, share-demo, fault-demo
 crates/cold          RustFS contract, pack/manifest, live probe
+crates/bench         paired-baseline stub (no timings)
 docs/adr             decision records
 COMPATIBILITY.md     environment manifest
 ```
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/RISKS.md](docs/RISKS.md).
+Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/CORRECTNESS.md](docs/CORRECTNESS.md), [docs/RISKS.md](docs/RISKS.md), [docs/V1C_TEST_MATRIX.md](docs/V1C_TEST_MATRIX.md).
 
 ## License
 

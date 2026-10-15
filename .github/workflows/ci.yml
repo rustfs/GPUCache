@@ -20,10 +20,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets
+      - name: Fallback demo
+        run: cargo run -p gpucache-transport --bin fault-demo --quiet
+      - name: Paired baseline stub
+        run: cargo run -p gpucache-bench --bin paired-baseline --quiet
       - name: Reject accelerator crates in V1
         run: |
           if grep -RInE 'cuda|doca|nixl|rdma|spdk' crates/*/Cargo.toml; then
             echo "V1 crates must not depend on GPU or DPU stacks"
+            exit 1
+          fi
+          if grep -RInE 'reed_solomon|erasure_coding|parity_shard' crates --include '*.rs'; then
+            echo "V1 must not add erasure coding"
             exit 1
           fi
       - name: Keep the cold tier off the hot path
@@ -41,7 +49,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: |
+          echo "aarch64 cargo test is a CPU build. It is not a BlueField or DOCA run."
+          cargo test --workspace --all-targets
 
   test-aarch64-qemu:
     name: test (aarch64 qemu-user)

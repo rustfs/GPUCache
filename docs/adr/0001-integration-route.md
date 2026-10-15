@@ -29,6 +29,10 @@ When a GPU is authorized, the spike should:
 
 Prefer the hook that already exists in the pinned revision. Switch only if that spike fails. Do not start the second path in the same change.
 
+## V1 C
+
+The fault-matrix work did not run the GPU spike. This ADR stays **Pending**. No engine adapter was added.
+
 ## Consequences
 
 - Callers must not assume GPUCache can read an arbitrary engine's KV bytes.

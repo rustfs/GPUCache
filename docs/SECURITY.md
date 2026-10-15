@@ -1,4 +1,4 @@
-# Security (V1 B)
+# Security (V1 C)
 
 The library calls still require an `AuthContext`. The TCP service does too. It binds `127.0.0.1` unless the operator sets `--allow-remote`, and it refuses to start with an empty tenant policy. A data request with an unknown tenant, a mismatched trust domain, or a wrong fingerprint is `Unauthorized` and returns no payload. Hello carries versions and the store epoch only.
 
@@ -25,4 +25,4 @@ The fingerprint is a hash of a credential, never the credential. Do not pass a r
 
 ## Fallback
 
-Callers must treat every error and every miss as "recompute in the engine". They must not stitch a partial or quarantined block into a decode.
+Callers must treat every error and every miss as "recompute in the engine". They must not stitch a partial or quarantined block into a decode. V1 C checks that a wrong tenant, a wrong model, a corrupt file, a short write, and a failed disk write return no foreign payload. The synthetic check is exact token-id equality. See [CORRECTNESS.md](CORRECTNESS.md).

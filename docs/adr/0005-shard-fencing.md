@@ -12,7 +12,7 @@ A distributed KV tier needs to know which process may fill a block, and it needs
 
 `ShardDirectory` is local to one shard. One process is one shard. A single machine is shard 0 using the same methods as any other shard id.
 
-- Membership is a list of `(node_id, incarnation)` on that shard. A new member, a removed member, or a changed incarnation bumps the shard epoch and fails in-flight fills. An unchanged incarnation does not. The last member cannot be removed.
+- Membership is a list of `(node_id, incarnation)` on that shard. A new member, a removed member, or a newer incarnation bumps the shard epoch and fails in-flight fills. An unchanged incarnation does not. An older incarnation is rejected without changing the epoch. The last member cannot be removed.
 - There is no cross-shard quorum and no per-token index. The map key is the SHA-256 of the physical byte key. One entry is one in-flight fill.
 - Single-flight: the first same-epoch caller is the leader and reserves capacity credits once. A later same-tenant caller joins and does not reserve again. A different tenant is `Unauthorized`. The directory stores no payload. `Admit` is `Leader` or `Joined` only.
 - Completing or failing a fill requires the leader request id and the current epoch. A stale epoch is `EpochMismatch`. After the epoch moves, the fill is gone, credits are released, and a new fill may start. That new fill is not a hit.

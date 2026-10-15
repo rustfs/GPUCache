@@ -28,7 +28,7 @@ Every item has:
 - `epoch` — must equal the store epoch
 - `deadline_ms` — absolute monotonic deadline; `0` is malformed; `now >= deadline` is `TimedOut`
 
-Mutating ops are idempotent inside a bounded window. The same `request_id` and the same canonical arguments replay the stored result. The same id with different arguments is `IdempotencyConflict`. Lookup and Get are not logged; they are safe to repeat. A deadline miss before any mutation is not logged, so the caller can retry that id with a later deadline.
+Mutating ops are idempotent inside a bounded window. Within one authenticated tenant and trust domain, the same `request_id` and the same canonical arguments replay the stored result. The same id with different arguments is `IdempotencyConflict`. Lookup and Get are not logged. Each successful Get creates a reader pin, including repeated calls with the same request id; callers must release every pin. A global reader-pin admission cap is not implemented. A deadline miss before any mutation is not logged, so the caller can retry that id with a later deadline.
 
 ## Operations
 

@@ -134,3 +134,25 @@ See [../COMPATIBILITY.md](../COMPATIBILITY.md) and [V3_DPU_TARGETS.md](V3_DPU_TA
 ## Not operated here
 
 No NVMe format, no DPU mode change, no firmware, no IOMMU or BIOS change, no production network change, no hardware purchase. Those need a separate authorization. There is no website deploy and no crates.io publish in this milestone. G4 live calls stay env-gated.
+
+## CPU audit changes (2026-10-15)
+
+LRU recency is advisory. Lookup and Get update it in memory without filesystem writes.
+Commit batches and invalidation checkpoint it; restart may lose recent read ordering.
+Block persistence still uses the existing atomic-write and sync policy. A stale LRU
+checkpoint can change eviction order, never tenant identity or checksum validation.
+
+A TCP client becomes unusable after an incomplete or malformed exchange. Recompute
+and reconnect before issuing another cache request. The connect call uses its
+configured timeout. Socket I/O timeouts are not total RPC deadlines and do not
+bound a store lock or a filesystem syscall. Zero server I/O timeouts are rejected.
+
+The buffer pool owns receive payloads through decoding; framing writes borrow the
+encoded payload through vectored I/O. This removes framing copies, not all copies.
+Serialization, storage ownership, and Get replies still copy bytes. Parsing and
+reply serialization run outside the store mutex; storage I/O remains inside it.
+
+Run the optional local microbenchmarks with
+`cargo run --release -p gpucache-transport --example cpu_audit`.
+These measure synthetic CPU/file operations only. They do not measure RDMA, GPU
+inference, TTFT, TPOT, DPU savings, or TCO.

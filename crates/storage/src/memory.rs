@@ -124,7 +124,7 @@ pub struct MemoryStore {
     slots: HashMap<u64, Slot>,
     by_physical: HashMap<Vec<u8>, u64>,
     logical: HashMap<Vec<u8>, Vec<Vec<u8>>>,
-    idem: HashMap<RequestId, IdemRecord>,
+    idem: HashMap<(Vec<u8>, Vec<u8>, RequestId), IdemRecord>,
     next_generation: u64,
     next_region: u64,
     epoch: u64,
@@ -264,7 +264,7 @@ impl MemoryStore {
             &generation.to_le_bytes(),
             &observed_epoch.to_le_bytes(),
         ]);
-        if let Some(prev) = self.replay(request_id, &fp)? {
+        if let Some(prev) = self.replay(auth, request_id, &fp)? {
             return match prev {
                 IdemKind::Release(result) => result,
                 _ => Err(CacheError::IdempotencyConflict),
@@ -281,7 +281,13 @@ impl MemoryStore {
         self.ensure_idem_room(now_ms)?;
         let result =
             self.reclaim_fenced_inner(auth, epoch, deadline_ms, generation, observed_epoch, now_ms);
-        self.remember(request_id, fp, now_ms, IdemKind::Release(result.clone()))?;
+        self.remember(
+            auth,
+            request_id,
+            fp,
+            now_ms,
+            IdemKind::Release(result.clone()),
+        )?;
         result
     }
 
@@ -514,6 +520,7 @@ impl MemoryStore {
     /// and replaying the same request id must not report success.
     pub(crate) fn abandon_durable_commit(
         &mut self,
+        auth: &AuthContext,
         generation: u64,
         request_id: RequestId,
         now_ms: u64,
@@ -522,7 +529,7 @@ impl MemoryStore {
         if state != BlockState::Absent {
             return Err(CacheError::InUse { refs: 1 });
         }
-        self.idem.remove(&request_id);
+        self.idem.remove(&idem_key(auth, request_id));
         Ok(())
     }
 
@@ -573,6 +580,15 @@ impl MemoryStore {
         now_ms: u64,
     ) -> Result<BlockState, CacheError> {
         self.poll(now_ms);
+        self.force_evict_prepared(generation)
+    }
+
+    /// Evict after a caller has polled this batch's logical time. FileStore
+    /// uses this under exclusive access after taking its candidate snapshot.
+    pub(crate) fn force_evict_prepared(
+        &mut self,
+        generation: u64,
+    ) -> Result<BlockState, CacheError> {
         let slot = self
             .slots
             .get(&generation)
@@ -626,9 +642,9 @@ impl MemoryStore {
             if !layout_compatible(&slot.identity, query) {
                 continue;
             }
-            let payload = slot.bytes.clone().unwrap_or_default();
+            let payload = slot.bytes.as_deref().unwrap_or_default();
             if payload.len() as u64 != slot.length
-                || verify_checksum(&payload, slot.checksum).is_err()
+                || verify_checksum(payload, slot.checksum).is_err()
             {
                 corrupt.push(generation);
                 continue;
@@ -665,7 +681,7 @@ impl MemoryStore {
         }
     }
 
-    fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         auth: &AuthContext,
         now_ms: u64,
@@ -761,8 +777,20 @@ impl MemoryStore {
         now_ms: u64,
         item: &ReservePutItem,
     ) -> Result<ReserveOutcome, CacheError> {
+        self.reserve_admitting(auth, now_ms, item, |_, _| Ok(false))
+    }
+
+    /// Reclaim only after validation and an actual retained-byte admission
+    /// failure. Replays and continuations never request extra retained bytes.
+    pub(crate) fn reserve_admitting(
+        &mut self,
+        auth: &AuthContext,
+        now_ms: u64,
+        item: &ReservePutItem,
+        reclaim: impl FnOnce(&mut Self, u64) -> Result<bool, CacheError>,
+    ) -> Result<ReserveOutcome, CacheError> {
         let fp = reserve_fingerprint(item)?;
-        if let Some(prev) = self.replay(item.header.request_id, &fp)? {
+        if let Some(prev) = self.replay(auth, item.header.request_id, &fp)? {
             return match prev {
                 IdemKind::Reserve(result) => result,
                 _ => Err(CacheError::IdempotencyConflict),
@@ -770,8 +798,20 @@ impl MemoryStore {
         }
         self.preflight(&item.header, now_ms)?;
         self.ensure_idem_room(now_ms)?;
-        let result = self.reserve_new(auth, now_ms, item);
+        let mut result = self.reserve_new(auth, now_ms, item);
+        if item.generation == 0
+            && matches!(
+                result,
+                Err(CacheError::QuotaExceeded {
+                    kind: QuotaKind::RetainedBytes | QuotaKind::TenantRetainedBytes
+                })
+            )
+            && reclaim(self, item.length)?
+        {
+            result = self.reserve_new(auth, now_ms, item);
+        }
         self.remember(
+            auth,
             item.header.request_id,
             fp,
             now_ms,
@@ -937,7 +977,7 @@ impl MemoryStore {
             &item.length.to_le_bytes(),
             &item.checksum.0,
         ]);
-        if let Some(prev) = self.replay(item.header.request_id, &fp)? {
+        if let Some(prev) = self.replay(auth, item.header.request_id, &fp)? {
             return match prev {
                 IdemKind::Commit(result) => result,
                 _ => Err(CacheError::IdempotencyConflict),
@@ -947,6 +987,7 @@ impl MemoryStore {
         self.ensure_idem_room(now_ms)?;
         let result = self.commit_new(auth, now_ms, item);
         self.remember(
+            auth,
             item.header.request_id,
             fp,
             now_ms,
@@ -975,7 +1016,7 @@ impl MemoryStore {
                 slot.fail,
                 slot.length,
                 slot.checksum,
-                slot.bytes.clone().unwrap_or_default(),
+                slot.bytes.as_deref().unwrap_or_default(),
             )
         };
         if reserve_epoch != self.epoch {
@@ -996,7 +1037,7 @@ impl MemoryStore {
                 actual: item.length,
             });
         }
-        if item.checksum != declared_sum || verify_checksum(&payload, declared_sum).is_err() {
+        if item.checksum != declared_sum || verify_checksum(payload, declared_sum).is_err() {
             self.reject_write(generation)?;
             return Err(CacheError::ChecksumMismatch);
         }
@@ -1087,7 +1128,7 @@ impl MemoryStore {
         item: &ReleaseCancelItem,
     ) -> Result<ReleaseOutcome, CacheError> {
         let fp = release_fingerprint(item);
-        if let Some(prev) = self.replay(item.header.request_id, &fp)? {
+        if let Some(prev) = self.replay(auth, item.header.request_id, &fp)? {
             return match prev {
                 IdemKind::Release(result) => result,
                 _ => Err(CacheError::IdempotencyConflict),
@@ -1097,6 +1138,7 @@ impl MemoryStore {
         self.ensure_idem_room(now_ms)?;
         let result = self.release_new(auth, now_ms, item);
         self.remember(
+            auth,
             item.header.request_id,
             fp,
             now_ms,
@@ -1180,7 +1222,7 @@ impl MemoryStore {
             &item.header.epoch.to_le_bytes(),
             &item.generation.to_le_bytes(),
         ]);
-        if let Some(prev) = self.replay(item.header.request_id, &fp)? {
+        if let Some(prev) = self.replay(auth, item.header.request_id, &fp)? {
             return match prev {
                 IdemKind::Invalidate(result) => result,
                 _ => Err(CacheError::IdempotencyConflict),
@@ -1190,6 +1232,7 @@ impl MemoryStore {
         self.ensure_idem_room(now_ms)?;
         let result = self.invalidate_new(auth, now_ms, item);
         self.remember(
+            auth,
             item.header.request_id,
             fp,
             now_ms,
@@ -1483,18 +1526,6 @@ impl MemoryStore {
             self.tenant_inflight.get(&tenant).copied().unwrap_or(0),
             inflight_delta,
         )?;
-        if target.retained && !current.retained {
-            if new_retained > self.limits.max_retained_bytes {
-                return Err(CacheError::QuotaExceeded {
-                    kind: QuotaKind::RetainedBytes,
-                });
-            }
-            if new_tenant_retained > self.limits.max_retained_bytes_per_tenant {
-                return Err(CacheError::QuotaExceeded {
-                    kind: QuotaKind::TenantRetainedBytes,
-                });
-            }
-        }
         if target.inflight && !current.inflight {
             if new_requests > u64::from(self.limits.max_in_flight_requests) {
                 return Err(CacheError::QuotaExceeded {
@@ -1504,6 +1535,18 @@ impl MemoryStore {
             if new_tenant_inflight > self.limits.max_in_flight_bytes_per_tenant {
                 return Err(CacheError::QuotaExceeded {
                     kind: QuotaKind::InFlightBytes,
+                });
+            }
+        }
+        if target.retained && !current.retained {
+            if new_retained > self.limits.max_retained_bytes {
+                return Err(CacheError::QuotaExceeded {
+                    kind: QuotaKind::RetainedBytes,
+                });
+            }
+            if new_tenant_retained > self.limits.max_retained_bytes_per_tenant {
+                return Err(CacheError::QuotaExceeded {
+                    kind: QuotaKind::TenantRetainedBytes,
                 });
             }
         }
@@ -1536,10 +1579,11 @@ impl MemoryStore {
 
     fn replay(
         &self,
+        auth: &AuthContext,
         id: RequestId,
         fingerprint: &Checksum,
     ) -> Result<Option<IdemKind>, CacheError> {
-        match self.idem.get(&id) {
+        match self.idem.get(&idem_key(auth, id)) {
             None => Ok(None),
             Some(record) if &record.fingerprint == fingerprint => Ok(Some(record.kind.clone())),
             Some(_) => Err(CacheError::IdempotencyConflict),
@@ -1558,13 +1602,14 @@ impl MemoryStore {
 
     fn remember(
         &mut self,
+        auth: &AuthContext,
         id: RequestId,
         fingerprint: Checksum,
         now_ms: u64,
         kind: IdemKind,
     ) -> Result<(), CacheError> {
         self.idem.insert(
-            id,
+            idem_key(auth, id),
             IdemRecord {
                 fingerprint,
                 inserted_ms: now_ms,
@@ -1579,6 +1624,14 @@ impl MemoryStore {
         self.idem
             .retain(|_, record| now_ms.saturating_sub(record.inserted_ms) < ttl);
     }
+}
+
+fn idem_key(auth: &AuthContext, id: RequestId) -> (Vec<u8>, Vec<u8>, RequestId) {
+    (
+        auth.tenant.as_bytes().to_vec(),
+        auth.trust_domain.as_bytes().to_vec(),
+        id,
+    )
 }
 
 fn layout_compatible(stored: &CacheIdentity, query: &CacheIdentity) -> bool {

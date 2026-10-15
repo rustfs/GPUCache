@@ -77,7 +77,7 @@ impl Slab {
         })
     }
 
-    fn insert(&mut self, tenant: &[u8], bytes: &[u8]) -> Result<u64, CacheError> {
+    fn insert(&mut self, tenant: Vec<u8>, bytes: Vec<u8>) -> Result<u64, CacheError> {
         let len = bytes.len() as u64;
         let next = self
             .used
@@ -93,12 +93,13 @@ impl Slab {
         let id = self.next;
         self.next += 1;
         self.used = next;
+        let checksum = content_checksum(&bytes);
         self.slots.insert(
             id,
             Slot {
-                tenant: tenant.to_vec(),
-                bytes: bytes.to_vec(),
-                checksum: content_checksum(bytes),
+                tenant,
+                bytes,
+                checksum,
                 exposed: true,
             },
         );
@@ -146,6 +147,7 @@ enum Pending {
 pub struct StorageQueue {
     slab: Slab,
     pending: BTreeMap<u64, Pending>,
+    pending_bytes: u64,
     next_task: u64,
     max_inflight: usize,
     control_up: bool,
@@ -159,6 +161,7 @@ impl StorageQueue {
         Ok(Self {
             slab: Slab::new(cap_bytes)?,
             pending: BTreeMap::new(),
+            pending_bytes: 0,
             next_task: 1,
             max_inflight,
             control_up: true,
@@ -175,6 +178,13 @@ impl StorageQueue {
 
     pub fn submit_write(&mut self, tenant: &[u8], payload: &[u8]) -> Result<TaskId, CacheError> {
         self.admit(tenant, payload.len())?;
+        let next = self.pending_bytes.saturating_add(payload.len() as u64);
+        if next.saturating_add(self.slab.used) > self.slab.cap {
+            return Err(CacheError::QuotaExceeded {
+                kind: gpucache_core_types::QuotaKind::RetainedBytes,
+            });
+        }
+        self.pending_bytes = next;
         self.enqueue(Pending::Write {
             tenant: tenant.to_vec(),
             payload: payload.to_vec(),
@@ -195,7 +205,8 @@ impl StorageQueue {
         };
         let (slot, payload) = match pending {
             Pending::Write { tenant, payload } => {
-                let id = self.slab.insert(&tenant, &payload)?;
+                self.pending_bytes -= payload.len() as u64;
+                let id = self.slab.insert(tenant, payload)?;
                 (Some(id), None)
             }
             Pending::Read { tenant, slot } => {
@@ -207,8 +218,12 @@ impl StorageQueue {
     }
 
     pub fn fail(&mut self, task: TaskId) -> Result<(), CacheError> {
-        if self.pending.remove(&task.0).is_none() {
-            return Err(CacheError::UnknownGeneration);
+        let pending = self
+            .pending
+            .remove(&task.0)
+            .ok_or(CacheError::UnknownGeneration)?;
+        if let Pending::Write { payload, .. } = pending {
+            self.pending_bytes -= payload.len() as u64;
         }
         Ok(())
     }
@@ -217,21 +232,24 @@ impl StorageQueue {
         match fault {
             Fault::DpuRestart => {
                 self.pending.clear();
+                self.pending_bytes = 0;
                 self.slab.restart();
                 self.control_up = true;
             }
             Fault::GpuReset | Fault::NicFlap | Fault::StorageLoss => {
                 self.pending.clear();
+                self.pending_bytes = 0;
                 self.slab.hide_all();
                 self.control_up = true;
             }
             Fault::NvmeTimeout => {
                 if let Some(id) = self.pending.keys().next().copied() {
-                    self.pending.remove(&id);
+                    let _ = self.fail(TaskId(id));
                 }
             }
             Fault::ControlPlaneLoss => {
                 self.pending.clear();
+                self.pending_bytes = 0;
                 self.slab.hide_all();
                 self.control_up = false;
             }
@@ -437,5 +455,52 @@ mod tests {
                 reason: "clean miss"
             }
         );
+    }
+    #[test]
+    fn pending_writes_share_the_slab_budget_and_release_credit_on_failure() {
+        let mut queue = StorageQueue::open_simulated(8, 4).unwrap();
+        let first = queue.submit_write(b"tenant-a", b"12345678").unwrap();
+        assert!(matches!(
+            queue.submit_write(b"tenant-a", b"x"),
+            Err(CacheError::QuotaExceeded { .. })
+        ));
+        assert_eq!(queue.pending_bytes, 8);
+        queue.fail(first).unwrap();
+        assert_eq!(queue.pending_bytes, 0);
+        let first = queue.submit_write(b"tenant-a", b"12345678").unwrap();
+        queue.complete(first).unwrap();
+        assert_eq!(queue.pending_bytes, 0);
+        assert!(matches!(
+            queue.submit_write(b"tenant-a", b"x"),
+            Err(CacheError::QuotaExceeded { .. })
+        ));
+        queue.apply_fault(Fault::DpuRestart);
+        queue.submit_write(b"tenant-a", b"12345678").unwrap();
+    }
+
+    #[test]
+    fn faults_release_pending_credit_but_do_not_free_hidden_slots() {
+        for fault in [
+            Fault::DpuRestart,
+            Fault::GpuReset,
+            Fault::NicFlap,
+            Fault::StorageLoss,
+            Fault::NvmeTimeout,
+            Fault::ControlPlaneLoss,
+        ] {
+            let mut queue = StorageQueue::open_simulated(8, 4).unwrap();
+            let first = queue.submit_write(b"tenant-a", b"1234").unwrap();
+            queue.complete(first).unwrap();
+            queue.submit_write(b"tenant-a", b"5678").unwrap();
+            queue.apply_fault(fault);
+            assert_eq!(queue.pending_bytes, 0);
+            if fault == Fault::ControlPlaneLoss {
+                queue.restore_control();
+            }
+            queue.submit_write(b"tenant-a", b"5678").unwrap();
+            if fault != Fault::DpuRestart {
+                assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+            }
+        }
     }
 }

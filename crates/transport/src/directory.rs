@@ -88,6 +88,8 @@ pub struct ShardDirectory {
     epoch: u64,
     members: Vec<MemberView>,
     flights: BTreeMap<[u8; 32], Flight>,
+    by_request: BTreeMap<(Vec<u8>, [u8; 16]), [u8; 32]>,
+    by_id: BTreeMap<u64, [u8; 32]>,
     credits_used: u64,
     credit_bytes: u64,
     tenant_used: BTreeMap<Vec<u8>, u64>,
@@ -114,6 +116,8 @@ impl ShardDirectory {
                 incarnation: 1,
             }],
             flights: BTreeMap::new(),
+            by_request: BTreeMap::new(),
+            by_id: BTreeMap::new(),
             credits_used: 0,
             credit_bytes: params.credit_bytes,
             tenant_used: BTreeMap::new(),
@@ -177,6 +181,9 @@ impl ShardDirectory {
             if self.members[pos].incarnation == incarnation {
                 return Ok(self.epoch);
             }
+            if incarnation < self.members[pos].incarnation {
+                return Err(CacheError::FencingRejected { reason: "member" });
+            }
             self.members[pos].incarnation = incarnation;
             return Ok(self.fence_inflight());
         }
@@ -213,11 +220,15 @@ impl ShardDirectory {
         self.check_epoch(req.epoch)?;
         validate_fill(req)?;
         let key = flight_key(&req.physical_key);
-        if let Some(existing) = self.key_for_request(req.request) {
+        let request_key = (req.tenant.clone(), req.request);
+        if let Some(existing) = self.by_request.get(&request_key).copied() {
             if existing != key {
                 return Err(CacheError::IdempotencyConflict);
             }
             let flight = &self.flights[&existing];
+            if flight.bytes != req.bytes {
+                return Err(CacheError::IdempotencyConflict);
+            }
             if flight.leader == req.request {
                 return Ok(Admit::Leader {
                     flight_id: flight.id,
@@ -233,12 +244,16 @@ impl ShardDirectory {
             if flight.tenant.as_slice() != req.tenant.as_slice() {
                 return Err(CacheError::Unauthorized);
             }
+            if flight.bytes != req.bytes {
+                return Err(CacheError::IdempotencyConflict);
+            }
             if flight.waiters.len() >= self.max_waiters {
                 return Err(CacheError::QuotaExceeded {
                     kind: QuotaKind::InFlightRequests,
                 });
             }
             flight.waiters.insert(req.request);
+            self.by_request.insert(request_key, key);
             return Ok(Admit::Joined {
                 flight_id: flight.id,
                 epoch: flight.epoch,
@@ -252,6 +267,8 @@ impl ShardDirectory {
         self.reserve(&req.tenant, req.bytes)?;
         let id = self.next_flight;
         self.next_flight += 1;
+        self.by_request.insert(request_key, key);
+        self.by_id.insert(id, key);
         self.flights.insert(
             key,
             Flight {
@@ -294,12 +311,7 @@ impl ShardDirectory {
         request: [u8; 16],
     ) -> Result<(), CacheError> {
         self.check_epoch(request_epoch)?;
-        let Some(key) = self
-            .flights
-            .iter()
-            .find(|(_, flight)| flight.id == flight_id)
-            .map(|(key, _)| *key)
-        else {
+        let Some(key) = self.by_id.get(&flight_id).copied() else {
             return Err(CacheError::UnknownGeneration);
         };
         let flight = &self.flights[&key];
@@ -308,12 +320,22 @@ impl ShardDirectory {
         }
         let tenant = flight.tenant.clone();
         let bytes = flight.bytes;
-        self.flights.remove(&key);
+        let flight = self
+            .flights
+            .remove(&key)
+            .ok_or(CacheError::UnknownGeneration)?;
+        self.by_id.remove(&flight_id);
+        self.by_request.remove(&(tenant.clone(), flight.leader));
+        for waiter in flight.waiters {
+            self.by_request.remove(&(tenant.clone(), waiter));
+        }
         self.release(&tenant, bytes)
     }
 
     fn fence_inflight(&mut self) -> u64 {
         self.epoch = self.epoch.saturating_add(1);
+        self.by_request.clear();
+        self.by_id.clear();
         let flights = std::mem::take(&mut self.flights);
         for (_, flight) in flights {
             let _ = self.release(&flight.tenant, flight.bytes);
@@ -362,16 +384,6 @@ impl ShardDirectory {
             .checked_sub(bytes)
             .ok_or(CacheError::Storage { reason: "credits" })?;
         Ok(())
-    }
-
-    fn key_for_request(&self, request: [u8; 16]) -> Option<[u8; 32]> {
-        self.flights.iter().find_map(|(key, flight)| {
-            if flight.leader == request || flight.waiters.contains(&request) {
-                Some(*key)
-            } else {
-                None
-            }
-        })
     }
 }
 
@@ -563,5 +575,70 @@ mod tests {
         assert_eq!(dir.note_member(1, 1).unwrap(), 1);
         assert_eq!(dir.inflight(), 1);
         assert_eq!(dir.credits_used(), 10);
+    }
+    #[test]
+    fn tenant_and_size_are_checked_before_replay_or_join() {
+        let mut dir = ShardDirectory::single_node(params());
+        dir.begin_or_join(&fill(b"a", b"tenant-a", 10, 1, 1))
+            .unwrap();
+        assert_eq!(
+            dir.begin_or_join(&fill(b"a", b"tenant-b", 10, 1, 1)),
+            Err(CacheError::Unauthorized)
+        );
+        assert_eq!(
+            dir.begin_or_join(&fill(b"a", b"tenant-a", 20, 1, 1)),
+            Err(CacheError::IdempotencyConflict)
+        );
+        assert_eq!(
+            dir.begin_or_join(&fill(b"a", b"tenant-a", 20, 2, 1)),
+            Err(CacheError::IdempotencyConflict)
+        );
+        dir.begin_or_join(&fill(b"b", b"tenant-b", 10, 1, 1))
+            .unwrap();
+        assert_eq!(dir.credits_used(), 20);
+    }
+
+    #[test]
+    fn indexes_are_reclaimed_on_completion_failure_and_fencing() {
+        let mut dir = ShardDirectory::single_node(params());
+        for finish in 0..3 {
+            let epoch = dir.epoch();
+            let Admit::Leader { flight_id, .. } = dir
+                .begin_or_join(&fill(b"a", b"tenant-a", 10, 1, epoch))
+                .unwrap()
+            else {
+                panic!("leader")
+            };
+            dir.begin_or_join(&fill(b"a", b"tenant-a", 10, 2, epoch))
+                .unwrap();
+            match finish {
+                0 => dir
+                    .complete_flight(flight_id, epoch, 1u128.to_le_bytes())
+                    .unwrap(),
+                1 => dir
+                    .fail_flight(flight_id, epoch, 1u128.to_le_bytes())
+                    .unwrap(),
+                _ => {
+                    dir.fence_epoch();
+                }
+            }
+            assert!(dir.by_request.is_empty());
+            assert!(dir.by_id.is_empty());
+            assert_eq!(dir.credits_used(), 0);
+        }
+    }
+
+    #[test]
+    fn stale_membership_does_not_fence_current_work() {
+        let mut dir = ShardDirectory::single_node(params());
+        let epoch = dir.note_member(1, 2).unwrap();
+        dir.begin_or_join(&fill(b"a", b"tenant-a", 10, 1, epoch))
+            .unwrap();
+        assert_eq!(
+            dir.note_member(1, 1),
+            Err(CacheError::FencingRejected { reason: "member" })
+        );
+        assert_eq!(dir.epoch(), epoch);
+        assert_eq!(dir.inflight(), 1);
     }
 }

@@ -6,13 +6,13 @@
 //! does not open block devices, format disks, or issue NVMe admin commands.
 //! A lost or corrupt file is a miss. There is no erasure coding and no replica.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use gpucache_core_types::{
-    verify_checksum, BlockState, ByteReader, ByteWriter, CacheError, QuotaKind, ResourceLimits,
+    verify_checksum, BlockState, ByteReader, ByteWriter, CacheError, ResourceLimits,
 };
 use gpucache_protocol::{
     AuthContext, BatchReply, CommitItem, CommitOutcome, GetHit, GetItem, InvalidateItem,
@@ -150,22 +150,24 @@ impl FileStore {
         now_ms: u64,
         items: Vec<ReservePutItem>,
     ) -> Result<BatchReply<ReserveOutcome>, CacheError> {
-        self.ensure_batch(items.len())?;
+        let ids: Vec<_> = items.iter().map(|item| item.header.request_id).collect();
+        self.inner.prepare(auth, now_ms, &ids)?;
         let mut out = Vec::with_capacity(items.len());
-        let mut epoch = self.inner.epoch();
         for item in items {
-            self.ensure_room(auth.tenant.as_bytes(), item.length, now_ms)?;
-            let reply = self.inner.reserve_put(auth, now_ms, vec![item])?;
-            epoch = reply.store_epoch;
-            let Some(result) = reply.items.into_iter().next() else {
-                return Err(CacheError::Malformed {
-                    reason: "reserve batch",
+            let root = &self.root;
+            let lru = &mut self.lru;
+            let body = self
+                .inner
+                .reserve_admitting(auth, now_ms, &item, |inner, extra| {
+                    Self::ensure_room(inner, lru, root, auth.tenant.as_bytes(), extra, now_ms)
                 });
-            };
-            out.push(result);
+            out.push(ItemResult {
+                request_id: item.header.request_id,
+                body,
+            });
         }
         Ok(BatchReply {
-            store_epoch: epoch,
+            store_epoch: self.inner.epoch(),
             items: out,
         })
     }
@@ -188,6 +190,7 @@ impl FileStore {
                     }
                     Err(err) => {
                         let _ = self.inner.abandon_durable_commit(
+                            auth,
                             outcome.generation,
                             request_id,
                             now_ms,
@@ -202,6 +205,7 @@ impl FileStore {
             };
             out.push(ItemResult { request_id, body });
         }
+        let _ = self.write_lru();
         Ok(BatchReply {
             store_epoch: reply.store_epoch,
             items: out,
@@ -251,79 +255,61 @@ impl FileStore {
         Ok(reply)
     }
 
-    fn ensure_batch(&self, len: usize) -> Result<(), CacheError> {
-        if len == 0 {
-            return Err(CacheError::Malformed {
-                reason: "empty batch",
-            });
-        }
-        if len > self.limits().max_batch_items as usize {
-            return Err(CacheError::QuotaExceeded {
-                kind: QuotaKind::BatchItems,
-            });
-        }
-        Ok(())
-    }
-
-    fn ensure_room(&mut self, tenant: &[u8], extra: u64, now_ms: u64) -> Result<(), CacheError> {
-        if extra > self.limits().max_retained_bytes {
-            return Ok(());
-        }
-        loop {
-            let global = self.inner.stats().retained_bytes;
-            let tenant_used = self.inner.tenant_retained_bytes(tenant);
-            let global_ok = global.saturating_add(extra) <= self.limits().max_retained_bytes;
-            let tenant_ok =
-                tenant_used.saturating_add(extra) <= self.limits().max_retained_bytes_per_tenant;
-            if global_ok && tenant_ok {
-                return Ok(());
-            }
-            let only_tenant = if tenant_ok { None } else { Some(tenant) };
-            if !self.evict_oldest(now_ms, only_tenant)? {
-                return Ok(());
-            }
-        }
-    }
-
-    fn evict_oldest(
-        &mut self,
+    fn ensure_room(
+        inner: &mut MemoryStore,
+        lru: &mut VecDeque<u64>,
+        root: &Path,
+        tenant: &[u8],
+        extra: u64,
         now_ms: u64,
-        only_tenant: Option<&[u8]>,
     ) -> Result<bool, CacheError> {
-        let candidates = self.inner.eviction_candidates(now_ms);
-        let n = self.lru.len();
-        let mut deferred = Vec::new();
-        let mut freed = false;
-        for _ in 0..n {
-            let Some(generation) = self.lru.pop_front() else {
-                break;
-            };
-            let Some(candidate) = candidates.iter().find(|item| item.generation == generation)
-            else {
-                continue;
-            };
-            let wrong_tenant =
-                only_tenant.is_some_and(|tenant| tenant != candidate.tenant.as_slice());
-            if candidate.pinned || wrong_tenant {
-                deferred.push(generation);
-                continue;
+        let limits = inner.limits();
+        if extra > limits.max_retained_bytes || extra > limits.max_retained_bytes_per_tenant {
+            return Ok(false);
+        }
+        // One snapshot and index per admission, rather than rescanning all
+        // slots and linearly searching the snapshot for every victim.
+        let candidates: std::collections::HashMap<_, _> = inner
+            .eviction_candidates(now_ms)
+            .into_iter()
+            .map(|candidate| (candidate.generation, candidate))
+            .collect();
+        let mut global = inner.stats().retained_bytes;
+        let mut tenant_used = inner.tenant_retained_bytes(tenant);
+        // If the tenant limit is tight, reclaim from that tenant first. Keep
+        // skipped entries in their original relative order.
+        for tenant_only in [true, false] {
+            let mut kept = VecDeque::with_capacity(lru.len());
+            while let Some(generation) = lru.pop_front() {
+                let global_ok = global.saturating_add(extra) <= limits.max_retained_bytes;
+                let tenant_ok =
+                    tenant_used.saturating_add(extra) <= limits.max_retained_bytes_per_tenant;
+                let needs_room = if tenant_only {
+                    !tenant_ok
+                } else {
+                    !global_ok && tenant_ok
+                };
+                let Some(candidate) = candidates.get(&generation) else {
+                    continue;
+                };
+                let same_tenant = candidate.tenant.as_slice() == tenant;
+                if !needs_room || candidate.pinned || (tenant_only && !same_tenant) {
+                    kept.push_back(generation);
+                    continue;
+                }
+                if inner.force_evict_prepared(generation)? == BlockState::Absent {
+                    let _ = fs::remove_file(block_path(root, generation));
+                    global = global.saturating_sub(candidate.length);
+                    if same_tenant {
+                        tenant_used = tenant_used.saturating_sub(candidate.length);
+                    }
+                } else {
+                    kept.push_back(generation);
+                }
             }
-            let state = self.inner.force_evict_committed(generation, now_ms)?;
-            self.delete_block(generation);
-            if state != BlockState::Absent {
-                self.lru.push_back(generation);
-                continue;
-            }
-            freed = true;
-            break;
+            *lru = kept;
         }
-        for generation in deferred {
-            self.lru.push_back(generation);
-        }
-        if freed {
-            let _ = self.write_lru();
-        }
-        Ok(freed)
+        Ok(true)
     }
 
     fn persist_committed(&mut self, generation: u64) -> Result<(), CacheError> {
@@ -345,7 +331,6 @@ impl FileStore {
     fn touch(&mut self, generation: u64) {
         self.lru.retain(|existing| *existing != generation);
         self.lru.push_back(generation);
-        let _ = self.write_lru();
     }
 
     fn delete_block(&self, generation: u64) {
@@ -514,17 +499,19 @@ fn load_blocks(
 
 fn read_lru(root: &Path, loaded: &[u64]) -> VecDeque<u64> {
     let path = root.join("LRU");
-    let bytes = fs::read(&path).unwrap_or_default();
+    let bytes = read_capped(&path, 10 + 1_000_000 * 8).unwrap_or_default();
+    let loaded_set: HashSet<_> = loaded.iter().copied().collect();
+    let mut seen = HashSet::new();
     let mut order = VecDeque::new();
     if let Some(gens) = decode_lru(&bytes) {
         for generation in gens {
-            if loaded.contains(&generation) && !order.contains(&generation) {
+            if loaded_set.contains(&generation) && seen.insert(generation) {
                 order.push_back(generation);
             }
         }
     }
     for generation in loaded {
-        if !order.contains(generation) {
+        if seen.insert(*generation) {
             order.push_back(*generation);
         }
     }

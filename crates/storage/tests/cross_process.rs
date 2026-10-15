@@ -64,20 +64,23 @@ fn cross_process_corrupt_frame_is_rejected() {
     assert!(stderr.contains("checksum"), "stderr={stderr}");
 }
 
-fn xfer_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_kv_block_xfer").unwrap_or_else(|_| {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.pop();
-        path.pop();
-        path.push("target");
-        path.push("debug");
-        path.push("kv-block-xfer");
-        path.to_string_lossy().into_owned()
-    })
-}
-
 fn run_import(frame: &[u8]) -> std::process::Output {
-    let mut child = Command::new(xfer_bin())
+    // Cargo supplies the binary for the selected target/profile at compile
+    // time. Subprocesses do not inherit Cargo's target runner automatically.
+    let binary = env!("CARGO_BIN_EXE_kv-block-xfer");
+    // CI's runner is an executable plus whitespace-separated arguments;
+    // reuse it without invoking a shell or relying on binfmt registration.
+    let runner = std::env::var("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER").ok();
+    let mut command = match runner.as_deref() {
+        Some(runner) => {
+            let mut parts = runner.split_whitespace();
+            let mut command = Command::new(parts.next().expect("nonempty target runner"));
+            command.args(parts).arg(binary);
+            command
+        }
+        None => Command::new(binary),
+    };
+    let mut child = command
         .arg("import")
         .arg(FP_HEX)
         .stdin(Stdio::piped())
@@ -85,13 +88,15 @@ fn run_import(frame: &[u8]) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn kv-block-xfer");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(frame)
-        .expect("write frame");
-    child.wait_with_output().expect("wait")
+    let wrote = child.stdin.as_mut().expect("stdin").write_all(frame);
+    let output = child.wait_with_output().expect("wait");
+    assert!(
+        wrote.is_ok(),
+        "write frame: {wrote:?}; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn hex(bytes: &[u8]) -> String {

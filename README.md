@@ -8,9 +8,9 @@ GPUCache does not do erasure coding and does not keep durability replicas. A los
 
 ## Status
 
-**V1 milestones A, B, and C are implemented. DPU acceleration is not.**
+**V1 milestones A, B, and C are implemented. The V2 first slice is in progress. DPU acceleration is not.**
 
-V1 runs the cache contract on CPU. The long-term deployment target is a storage-side BlueField-3, but this repository does not link DOCA, CUDA, RDMA, or SPDK, and it does not claim that any of those paths exist. An aarch64 build is a CPU build. It is not a BlueField functional test.
+V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated registered-buffer pool, a shard-local directory, and a stricter G4 cold contract. The long-term deployment target is a storage-side BlueField-3, but this repository does not link DOCA, CUDA, RDMA, or SPDK, and it does not claim that any of those paths exist. Feature `rdma-nixl` does not link libnixl. An aarch64 build is a CPU build. It is not a BlueField functional test. GDS and BlueField offload are in development / `NOT_RUN_HARDWARE`.
 
 | Milestone | Status |
 | --- | --- |
@@ -19,7 +19,12 @@ V1 runs the cache contract on CPU. The long-term deployment target is a storage-
 | V1 B: TCP service, file backend, LRU admission, tenant quotas, two-client reuse | Implemented in this tree |
 | V1 B: RustFS live Put/Head/RangeGet/Delete | `NOT_RUN_HARDWARE` (no authorized endpoint). Contract mock passes |
 | V1 C: fuzz, fault injection, synthetic token checks, paired-baseline stubs | Implemented in this tree. Real engine output is `NOT_RUN_HARDWARE` |
-| V2: NIC RDMA (NIXL or Mooncake) plus a real RustFS cold path | Not started; blocked on V1 |
+| V2: `KvTransport`, TCP default, feature `rdma-nixl` | In progress. The feature compiles and `NixlTransport::open` refuses. Live RDMA is `NOT_RUN_HARDWARE` |
+| V2: bounded registered buffer pool (simulated pin, reuse, quarantine, backpressure) | Implemented in this tree. Not a NIC registration |
+| V2: shard-local directory, epoch fencing, single-flight, capacity credits | Implemented in-process. One process is one shard. No cross-shard quorum |
+| V2: G4 pack/manifest, async sink, cost-bounded refill | Implemented against the mock. Live RustFS is `NOT_RUN_HARDWARE` |
+| V2: P/D, G3.5, and G4 hop list | Documented in [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md). Not a zero-copy claim |
+| V2: paired TTFT/TPOT against native NIXL | `NOT_RUN_HARDWARE` |
 | V3: BlueField-3 data-path offload and production hardening | Not started; not purchased and not measured. Not an erasure-coding milestone |
 | Erasure coding and durability replicas | Will not be built. A lost or failed hot block is a clean miss, then recompute and repopulate. Cold durability is RustFS G4 |
 
@@ -43,7 +48,7 @@ The batch API is Lookup, Reserve/Put, Commit, Get, Release/Cancel, and Invalidat
 
 Lookup can return `PrefixHit` when a committed block's hash chain is a strict prefix of the query and the layout, dtype, shard, and model identity match. The hit is the whole stored block. `Get` must use `identity_for_prefix_hit`. A shorter `valid_length` on the same chain is an incompatible miss. The service does not slice inside a block.
 
-`gpucache-cold` packs blocks into an object plus a manifest and can Put, Head, RangeGet, and Delete through a trait. The TCP hot path does not call it. Without `GPUCACHE_RUSTFS_*` variables the live probe is `NOT_RUN_HARDWARE`. The mock still runs.
+`gpucache-cold` packs blocks into an object plus a manifest and can Put, Head, RangeGet, and Delete through a trait. The TCP hot path does not call it. Without `GPUCACHE_RUSTFS_*` variables the live probe is `NOT_RUN_HARDWARE`. The mock still runs. V2 adds a bounded async sink and a refill that returns no bytes when the manifest or the payload range exceeds its budget.
 
 Lifecycle:
 
@@ -87,6 +92,22 @@ Paired GPU baselines stay `NOT_RUN_HARDWARE` and print no timings:
 cargo run -p gpucache-bench --bin paired-baseline
 ```
 
+One shard, simulated registration, and the TCP staging path:
+
+```bash
+cargo run -p gpucache-transport --bin shard-demo
+```
+
+Success is `status=SHARD_OK`, `registration=SIMULATED`, and `rdma=NOT_RUN_HARDWARE`.
+
+Mock G4 pack, sink, and budget-capped refill:
+
+```bash
+cargo run -p gpucache-cold --bin cold-demo
+```
+
+Success is `status=COLD_CONTRACT_OK` and `gds=NOT_RUN_HARDWARE`. `rustfs_live=NOT_RUN_HARDWARE` when no endpoint is configured.
+
 `kv-block-xfer import <credential-hex>` reads one export frame on stdin and imports it into a fresh `MemoryStore`. It does not talk to an engine.
 
 ## Layout
@@ -95,14 +116,14 @@ cargo run -p gpucache-bench --bin paired-baseline
 crates/core-types    identity, keys, lifecycle, errors
 crates/protocol      batch messages, replies, version negotiation
 crates/storage       MemoryStore, FileStore, kv-block-xfer
-crates/transport     TCP server, client, share-demo, fault-demo
-crates/cold          RustFS contract, pack/manifest, live probe
+crates/transport     TCP server, client, transport trait, shard directory, share-demo, fault-demo, shard-demo
+crates/cold          RustFS contract, pack/manifest, async sink, refill, cold-demo
 crates/bench         paired-baseline stub (no timings)
 docs/adr             decision records
 COMPATIBILITY.md     environment manifest
 ```
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/CORRECTNESS.md](docs/CORRECTNESS.md), [docs/RISKS.md](docs/RISKS.md), [docs/V1C_TEST_MATRIX.md](docs/V1C_TEST_MATRIX.md).
+Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/CORRECTNESS.md](docs/CORRECTNESS.md), [docs/RISKS.md](docs/RISKS.md), [docs/V1C_TEST_MATRIX.md](docs/V1C_TEST_MATRIX.md), [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md), [docs/V2_TEST_MATRIX.md](docs/V2_TEST_MATRIX.md).
 
 ## License
 

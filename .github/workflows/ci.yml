@@ -24,14 +24,36 @@ jobs:
         run: cargo run -p gpucache-transport --bin fault-demo --quiet
       - name: Paired baseline stub
         run: cargo run -p gpucache-bench --bin paired-baseline --quiet
-      - name: Reject accelerator crates in V1
+      - name: Shard and cold demos
         run: |
-          if grep -RInE 'cuda|doca|nixl|rdma|spdk' crates/*/Cargo.toml; then
-            echo "V1 crates must not depend on GPU or DPU stacks"
-            exit 1
-          fi
+          cargo run -p gpucache-transport --bin shard-demo --quiet
+          cargo run -p gpucache-cold --bin cold-demo --quiet
+      - name: Optional RDMA feature still skips hardware
+        run: cargo test -p gpucache-transport --all-targets --features rdma-nixl
+      - name: Reject accelerator linkage and erasure coding
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          bad = re.compile(
+              r"^(cuda|doca|nixl|rdma|spdk|libnixl)([-_a-z0-9]*)?\s*=",
+              re.I,
+          )
+          failed = False
+          for path in pathlib.Path("crates").glob("*/Cargo.toml"):
+              in_deps = False
+              for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                  stripped = line.split("#", 1)[0].strip()
+                  if stripped.startswith("[") and stripped.endswith("]"):
+                      in_deps = "dependencies" in stripped
+                      continue
+                  if in_deps and bad.match(stripped):
+                      print(f"{path}:{lineno}: accelerator dependency is not allowed")
+                      failed = True
+          if failed:
+              sys.exit(1)
+          PY
           if grep -RInE 'reed_solomon|erasure_coding|parity_shard' crates --include '*.rs'; then
-            echo "V1 must not add erasure coding"
+            echo "erasure coding must not be added"
             exit 1
           fi
       - name: Keep the cold tier off the hot path

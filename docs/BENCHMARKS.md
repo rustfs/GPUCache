@@ -16,7 +16,12 @@ Paired baselines use the same prefix-cache idea on both sides when a GPU run exi
 | HBM within capacity | `NOT_RUN_HARDWARE` | Not run |
 | HBM cliff | `NOT_RUN_HARDWARE` | Not run |
 | Write cost | `NOT_RUN_HARDWARE` | Not recorded. A memcpy figure would not count |
+| V2 native NIXL P/D | `NOT_RUN_HARDWARE` | libnixl is not linked. `NixlTransport::open` refuses. Not a DPU result |
+| V2 Rust shared DRAM | `NOT_RUN_HARDWARE` | The simulated pool is a correctness stand-in, not a bandwidth run |
+| V2 Rust shared NVMe | `NOT_RUN_HARDWARE` | `FileStore` uses ordinary files. No device was formatted |
+| V2 RustFS refill | `NOT_RUN_HARDWARE` | Mock refill passes. Live endpoint was not configured |
+| V2 TTFT / TPOT / ITL / goodput | `NOT_RUN_HARDWARE` | No paired GPU trace. `staged_bytes` is a copy length, not wire bytes |
 
-There is no `FAIL_PERFORMANCE` figure because there is no paired measurement to fail. Do not add a benchmark that prints a success banner without raw samples, a manifest, and the hardware it ran on.
+There is no `FAIL_PERFORMANCE` figure because there is no paired measurement to fail. Do not add a benchmark that prints a success banner without raw samples, a manifest, and the hardware it ran on. The V2 CPU tests do not fill this gap.
 
 Correctness criteria for the CPU path are in [CORRECTNESS.md](CORRECTNESS.md).

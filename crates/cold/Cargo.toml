@@ -8,6 +8,10 @@ authors.workspace = true
 description = "Optional RustFS G4 cold-tier contract. Not on the GPUCache hot path."
 publish = false
 
+[[bin]]
+name = "cold-demo"
+path = "src/bin/cold_demo.rs"
+
 [dependencies]
 gpucache-core-types.workspace = true
 sha2.workspace = true

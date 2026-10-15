@@ -9,11 +9,18 @@
 
 #![forbid(unsafe_code)]
 
+mod demo;
 mod http;
 mod mock;
 mod pack;
 mod sigv4;
+mod sink;
 
+pub use demo::{run_cold_demo, ColdReport};
 pub use http::{live_probe, ProbeReport, ProbeStatus};
 pub use mock::MockObjectStore;
-pub use pack::{contract_smoke, pack_blocks, ObjectMeta, ObjectStore, PackedBlock, PayloadRange};
+pub use pack::{
+    contract_smoke, pack_blocks, read_manifest, Manifest, ObjectMeta, ObjectStore, PackedBlock,
+    PayloadRange,
+};
+pub use sink::{refill_generation, AsyncSink, ColdJob, RefillBudget, RefillOutcome};

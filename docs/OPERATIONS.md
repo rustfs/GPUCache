@@ -36,6 +36,21 @@ cargo run -p gpucache-transport --bin fault-demo
 
 The command uses a fresh temp directory. It commits a synthetic token block, reads it back from a second client, and checks the token ids exactly. An unknown key, a corrupt file after restart, a past deadline, a cancel, and a quota refusal all fail closed. The caller recomputes with the same pure function of those token ids. `status=FALLBACK_OK` is printed only after those checks. `tolerance=NONE` means no numeric slack was applied. A wrong tenant, model, tokenizer, adapter, or layout is not a hit.
 
+## V2 shard and cold demos
+
+```bash
+cargo run -p gpucache-transport --bin shard-demo
+cargo run -p gpucache-cold --bin cold-demo
+```
+
+`shard-demo` checks one shard, a joined fill, epoch fencing, quarantine across lease expiry, and a TCP host copy. It prints `rdma=NOT_RUN_HARDWARE`. `cold-demo` runs the mock pack, sink, and refill. It prints `gds=NOT_RUN_HARDWARE`. Without `GPUCACHE_RUSTFS_*` it also prints `rustfs_live=NOT_RUN_HARDWARE`.
+
+Optional feature check, still with no device:
+
+```bash
+cargo test -p gpucache-transport --all-targets --features rdma-nixl
+```
+
 The paired-baseline stub does not measure anything:
 
 ```bash

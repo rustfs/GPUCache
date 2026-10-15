@@ -1,4 +1,4 @@
-# Architecture (V1 C)
+# Architecture (V1 C, V2 first slice)
 
 GPUCache is a shared KV data tier. The hot tier is G3.5. RustFS is an optional colder G4 capacity tier. It is not on the prefill-to-decode path. The inference engine still owns tokenization, attention, and scheduling. This repo does not replace them.
 
@@ -18,14 +18,20 @@ gpucache-storage::MemoryStore
         v
 gpucache-core-types  (identity, keys, lifecycle, errors)
 
-gpucache-cold        optional G4 pack/manifest. Not linked by transport.
+gpucache-cold        optional G4 pack/manifest, async sink, budgeted refill.
+                     Not linked by transport.
+
+V2 control plane (same process, not a new wire protocol)
+  KvTransport        TCP submit is a host copy. NIXL open refuses.
+  RegisteredPool     simulated pin, reuse, quarantine. Not a NIC.
+  ShardDirectory     one shard per process. Epoch fence, single-flight, credits.
 ```
 
 `MemoryStore` remains the in-process contract. `FileStore` is what the TCP service uses. `gpucache-bench` only names the paired baselines and prints `NOT_RUN_HARDWARE`. Planned crates still absent: a standalone metadata service, an engine adapter, a DPU agent, and metrics. Their contracts stay out of `core-types` so GPU and DPU types do not leak in.
 
 ## Durability
 
-The hot tier does not repair lost blocks. There is no erasure coding and no replica set. Loss, corruption, a short write, a full disk, eviction, and a failed check are clean misses. The engine recomputes and may write the block again. If the directory write fails after the in-memory commit, that commit is abandoned and the request id is forgotten, so a replay cannot report success for bytes that were not stored. An extra copy of a hot shared prefix is a possible later latency optimization, not a durability feature, and it is not in this tree. Cold durability is RustFS's responsibility. See [adr/0002-no-erasure-coding.md](adr/0002-no-erasure-coding.md).
+The hot tier does not repair lost blocks. There is no erasure coding and no replica set. Loss, corruption, a short write, a full disk, eviction, and a failed check are clean misses. The engine recomputes and may write the block again. If the on-disk write fails after the in-memory commit, that commit is abandoned and the request id is forgotten, so a replay cannot report success for bytes that were not stored. An extra copy of a hot shared prefix is a possible later latency optimization, not a durability feature, and it is not in this tree. Cold durability is RustFS's responsibility. See [adr/0002-no-erasure-coding.md](adr/0002-no-erasure-coding.md).
 
 ## Identity
 
@@ -65,3 +71,13 @@ ABSENT -> RESERVED -> WRITING -> COMMITTED -> EVICTING -> ABSENT
 ## Cold tier
 
 `gpucache-cold` packs several blocks into one object and a manifest of payload offsets. Put, Head, RangeGet, and Delete are a trait. The mock implements them in memory. A live HTTP client runs only when the operator sets `GPUCACHE_RUSTFS_*`. Transport does not depend on this crate.
+
+## V2 control plane
+
+`KvTransport` is the byte-path trait. `TcpTransport::submit` copies into a bounded host buffer and reports `dma_posted=false`. `NixlTransport::open` fails closed. Feature `rdma-nixl` does not link libnixl. See [adr/0004-nixl-transport.md](adr/0004-nixl-transport.md) and [V2_DATA_PATHS.md](V2_DATA_PATHS.md).
+
+`RegisteredPool` is a fixed set of `Vec<u8>` slots. Checkout reuses a binding instead of allocating a new region id. Unknown completion quarantines the slot. Lease expiry does not free it. `fence_epoch` then `reclaim_fenced` does, and so does `attest_drain`. Retired ids are not recycled.
+
+`ShardDirectory` is local to one shard. Shard 0 is the single-node case and uses the same methods. A membership change bumps the epoch, drops in-flight fills, and releases credits. Single-flight joins do not charge twice and do not return payload bytes. There is no per-token central directory and no per-block quorum. See [adr/0005-shard-fencing.md](adr/0005-shard-fencing.md).
+
+The cold sink queues a pack and drains it with Put. Refill Heads the manifest first. Over budget returns `OverBudget` and no payload. That outcome is a recompute, not a hit.

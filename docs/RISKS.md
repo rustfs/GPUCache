@@ -23,6 +23,15 @@
 | Short write or disk full reported as a durable hit | Mitigated | The in-memory commit is abandoned and the request id is forgotten. See `docs/V1C_TEST_MATRIX.md` |
 | Hostile protocol bytes | Mitigated by decoder fuzz | `proptest` inside `cargo test`. Not a multi-hour libFuzzer run |
 | Wrong model or tokenizer hit | Mitigated | Those identities miss. Comparison of synthetic tokens is exact. `tolerance=NONE` |
-| Invented baseline numbers | Closed in this tree | `paired-baseline` prints `NOT_RUN_HARDWARE` and contains no digits |
+| Invented baseline numbers | Closed in this tree | `paired-baseline` and `v3-paired` print `NOT_RUN_HARDWARE` and contain no digits. TCO is `TCO_UNKNOWN` |
+| Simulated DPU queue treated as BlueField | Mitigated by labels | `dpu-demo` prints `offload_active=false` and `NOT_RUN_HARDWARE`. Feature `dpu-bf3` links nothing |
+| Hot-tier EC switched on through an ablation knob | Mitigated | `Ablation::set` rejects erasure coding. ADR 0002 |
+| Integrity seal treated as a MAC | Documented | SHA-256 of a length-delimited buffer. Not an HMAC. ADR 0007 |
+| Replay window eviction | Accepted | The oldest nonce can be reused after the cap. Not a permanent cache |
+| Secret audit leaking a credential | Mitigated in tests | Events store kinds and generation ids, not fingerprints |
+| Control-plane loss returning a stale hit | Mitigated on the simulated queue | Slots are hidden and new submits fail until `restore_control`. Old slots stay hidden |
+| RustFS slowness blocking prefill | Mitigated in the hook | `refill_degraded` returns `Missing` and does not call the store |
+| DOCA license and performance disclosure | `NOT_RUN_LICENSE` | No DOCA binary is linked. Review the actual EULA before linking or publishing numbers. See THIRD_PARTY_NOTICES.md |
+| Calling this tree production-ready or PB-scale | Closed | Both labels are `NOT_CLAIMED` |
 
 Minimum reproduction of the CPU contract is `cargo test --workspace --all-targets`. There is no hardware failure log because the hardware was not present.

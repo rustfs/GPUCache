@@ -8,9 +8,9 @@ GPUCache does not do erasure coding and does not keep durability replicas. A los
 
 ## Status
 
-**V1 milestones A, B, and C are implemented. The V2 first slice is in progress. DPU acceleration is not.**
+**V1 milestones A, B, and C are implemented. The V2 first slice is in this tree. V3 is in progress: a CPU contract for a storage-side BlueField path, plus production hooks that do not need a DPU. DPU acceleration is not measured.**
 
-V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated registered-buffer pool, a shard-local directory, and a stricter G4 cold contract. The long-term deployment target is a storage-side BlueField-3, but this repository does not link DOCA, CUDA, RDMA, or SPDK, and it does not claim that any of those paths exist. Feature `rdma-nixl` does not link libnixl. An aarch64 build is a CPU build. It is not a BlueField functional test. GDS and BlueField offload are in development / `NOT_RUN_HARDWARE`.
+V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated registered-buffer pool, a shard-local directory, and a stricter G4 cold contract. V3 adds an optional `dpu-bf3` feature that does not link DOCA or SPDK, a simulated DRAM-slab storage queue, and CPU-side authz, replay, quota, and cold-ops hooks. The long-term deployment target is a storage-side BlueField-3. The GPU client keeps an ordinary ConnectX. This repository does not link DOCA, CUDA, RDMA, or SPDK, and it does not claim that any of those paths ran. Feature `rdma-nixl` does not link libnixl. Feature `dpu-bf3` does not link a device. An aarch64 build is a CPU build. It is not a BlueField functional test. GDS, DOCA, and BlueField offload are in development / `NOT_RUN_HARDWARE` / optional feature. They are not "already implemented" and not "deployed".
 
 | Milestone | Status |
 | --- | --- |
@@ -25,10 +25,17 @@ V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated regist
 | V2: G4 pack/manifest, async sink, cost-bounded refill | Implemented against the mock. Live RustFS is `NOT_RUN_HARDWARE` |
 | V2: P/D, G3.5, and G4 hop list | Documented in [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md). Not a zero-copy claim |
 | V2: paired TTFT/TPOT against native NIXL | `NOT_RUN_HARDWARE` |
-| V3: BlueField-3 data-path offload and production hardening | Not started; not purchased and not measured. Not an erasure-coding milestone |
+| V3: `dpu-bf3` feature slot, simulated DRAM slab + storage queue, SPDK affinity check | In progress. Devices are not linked. `open_doca` / `open_nvme_device` / `open_spdk` refuse. `dpu-demo` prints `NOT_RUN_HARDWARE` |
+| V3: one candidate offload (storage queue) and ablation stubs | Interface only. P2P, DPA, compression, and crypto offload stay `NOT_RUN_HARDWARE` when enabled. Hot-tier EC cannot be enabled |
+| V3: authz, replay window, integrity seal, rate limit, secret rotation, audit | CPU hooks in this tree. Not mTLS. Trusted-fabric boundary is [docs/adr/0007-trusted-fabric.md](docs/adr/0007-trusted-fabric.md) |
+| V3: rebalance, rolling upgrade, fault-domain isolation | In-process stubs on the V2 shard directory. They fence fills. They do not copy a replica |
+| V3: degrade matrix (DPU restart, GPU reset, NIC flap, storage loss, NVMe timeout, control-plane loss, RustFS slow/down) | Decisions are clean misses. No payload, no wrong hit, no permanent block. Not a hardware fault injection |
+| V3: G4 retention, manifest version, reclaim, delete verification, tenant cold keys, backfill budget | Implemented against the mock. Live RustFS is `NOT_RUN_HARDWARE` |
+| V3: paired NIC-RDMA baseline vs DPU | `NOT_RUN_HARDWARE`. `tco=TCO_UNKNOWN`. `go_gate=NOT_EVALUATED`. TCP is not the DPU baseline |
+| V3: second engine (SGLang / HiCache) | Not added. Evaluation note only. See [docs/adr/0008-second-engine.md](docs/adr/0008-second-engine.md) |
 | Erasure coding and durability replicas | Will not be built. A lost or failed hot block is a clean miss, then recompute and repopulate. Cold durability is RustFS G4 |
 
-The integration route (native vLLM KV connector or LMCache) is **not chosen**. See [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md). Hot-tier failure policy is [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md).
+The integration route (native vLLM KV connector or LMCache) is **not chosen**. See [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md). Hot-tier failure policy is [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md). The V3 offload candidate is [docs/adr/0006-storage-queue-offload.md](docs/adr/0006-storage-queue-offload.md). It is a hypothesis pending a paired measurement, not a measured bottleneck.
 
 ## What V1 A does
 
@@ -108,6 +115,26 @@ cargo run -p gpucache-cold --bin cold-demo
 
 Success is `status=COLD_CONTRACT_OK` and `gds=NOT_RUN_HARDWARE`. `rustfs_live=NOT_RUN_HARDWARE` when no endpoint is configured.
 
+In-process DPU contract. This does not open a device:
+
+```bash
+cargo run -p gpucache-dpu --bin dpu-demo
+```
+
+Success is `status=DPU_CONTRACT_OK`, `offload_active=false`, and `hardware=NOT_RUN_HARDWARE`. `doca=NOT_LINKED`. Arm process start is not an offload.
+
+Optional feature, still with no SDK:
+
+```bash
+cargo test -p gpucache-dpu --all-targets --features dpu-bf3
+```
+
+V3 paired gate. No timings, no TCO, TCP is not the baseline:
+
+```bash
+cargo run -p gpucache-bench --bin v3-paired
+```
+
 `kv-block-xfer import <credential-hex>` reads one export frame on stdin and imports it into a fresh `MemoryStore`. It does not talk to an engine.
 
 ## Layout
@@ -117,13 +144,14 @@ crates/core-types    identity, keys, lifecycle, errors
 crates/protocol      batch messages, replies, version negotiation
 crates/storage       MemoryStore, FileStore, kv-block-xfer
 crates/transport     TCP server, client, transport trait, shard directory, share-demo, fault-demo, shard-demo
-crates/cold          RustFS contract, pack/manifest, async sink, refill, cold-demo
-crates/bench         paired-baseline stub (no timings)
+crates/cold          RustFS contract, pack/manifest, async sink, refill, retention, cold-demo
+crates/dpu           BlueField feature slot, simulated storage queue, dpu-demo. Not linked by transport
+crates/bench         paired-baseline and v3-paired stubs (no timings)
 docs/adr             decision records
 COMPATIBILITY.md     environment manifest
 ```
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/CORRECTNESS.md](docs/CORRECTNESS.md), [docs/RISKS.md](docs/RISKS.md), [docs/V1C_TEST_MATRIX.md](docs/V1C_TEST_MATRIX.md), [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md), [docs/V2_TEST_MATRIX.md](docs/V2_TEST_MATRIX.md).
+Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/CORRECTNESS.md](docs/CORRECTNESS.md), [docs/RISKS.md](docs/RISKS.md), [docs/V1C_TEST_MATRIX.md](docs/V1C_TEST_MATRIX.md), [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md), [docs/V2_TEST_MATRIX.md](docs/V2_TEST_MATRIX.md), [docs/V3_DPU_TARGETS.md](docs/V3_DPU_TARGETS.md), [docs/V3_TEST_MATRIX.md](docs/V3_TEST_MATRIX.md), [docs/V3_FAILURES.md](docs/V3_FAILURES.md).
 
 ## License
 

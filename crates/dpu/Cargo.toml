@@ -1,0 +1,24 @@
+[package]
+name = "gpucache-dpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "BlueField-3 feature slot and CPU-simulated storage-queue contract. Does not link DOCA, SPDK, or a DPU."
+publish = false
+
+[features]
+default = []
+# Slot only. Does not pull DOCA, SPDK, or a hardware SDK. See docs/adr/0006-storage-queue-offload.md.
+dpu-bf3 = []
+
+[dependencies]
+gpucache-core-types.workspace = true
+
+[[bin]]
+name = "dpu-demo"
+path = "src/bin/dpu_demo.rs"
+
+[lints]
+workspace = true

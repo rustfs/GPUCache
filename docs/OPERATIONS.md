@@ -91,6 +91,46 @@ There is no on-disk config file. Flags are the schema.
 
 Leave `GPUCACHE_RUSTFS_ENDPOINT`, `GPUCACHE_RUSTFS_BUCKET`, `GPUCACHE_RUSTFS_PREFIX`, `GPUCACHE_RUSTFS_ACCESS_KEY`, and `GPUCACHE_RUSTFS_SECRET_KEY` unset unless an operator has authorized a test bucket. Unset means `NOT_RUN_HARDWARE`. The mock smoke still runs inside `cargo test`. `https://` is `NOT_RUN_HARDWARE` in this milestone because no TLS stack is linked. Do not invent credentials.
 
+## V3 CPU commands
+
+```bash
+cargo run -p gpucache-dpu --bin dpu-demo
+cargo run -p gpucache-bench --bin v3-paired
+cargo test -p gpucache-dpu --all-targets --features dpu-bf3
+```
+
+`dpu-demo` prints the contract result and `NOT_RUN_HARDWARE`. `v3-paired` prints `TCO_UNKNOWN` and `go_gate=NOT_EVALUATED`. The feature test still refuses DOCA, SPDK, and NVMe open.
+
+## Diagnostics
+
+`dpu-demo` is the diagnostics sketch. It prints whether `dpu-bf3` was selected, that DOCA/SPDK/NVMe are not linked, that hot-tier EC is off, and that each planned target is `NOT_RUN_HARDWARE`. It does not print payloads, fingerprints, or prompts. There is no device health counter because no device is open.
+
+## Capacity
+
+Hot-tier limits (`ResourceLimits`, shard credits, the simulated slab cap, cold retention, the backfill byte budget) are admission ceilings for recomputable KV. They are not a measured cluster size. A lost hot block is a miss. Do not size the hot tier as the only copy of user data, and do not describe this tree as PB-scale. Cold retention deletes expired mock objects after a verified delete. It is not a second durability replica of the hot tier.
+
+## Upgrade and rollback
+
+`ControlPlane::begin_upgrade` stops new fills. In-flight fills can still complete. `rollback` before finish returns to serving without a fence. `finish_upgrade` bumps a software generation and fences, so old epochs miss and the engine recomputes. `rollback` after finish fences again. The generation counter does not decrease. No BlueField firmware, BFB, or DOCA package is part of this rollback. The TCP wire format is unchanged apart from quota kind byte 8 (`RateLimit`) on error replies.
+
+## Minimal deploy example
+
+Development only, loopback, ordinary files, no DPU mode change:
+
+```bash
+cargo run -p gpucache-transport --bin gpucache-tcp -- serve \
+  --data-dir /tmp/gpucache-dev \
+  --tenant tenant-a \
+  --trust td-local \
+  --fingerprint <64 hex chars of a credential hash>
+```
+
+Then, in another shell, `cargo run -p gpucache-dpu --bin dpu-demo` shows the offload interface is still `NOT_RUN_HARDWARE`. Do not point `--data-dir` at a device node. Do not pass a live secret as the fingerprint; pass the hash.
+
+## Compatibility
+
+See [../COMPATIBILITY.md](../COMPATIBILITY.md) and [V3_DPU_TARGETS.md](V3_DPU_TARGETS.md). TCP remains the correctness path. `rdma-nixl` and `dpu-bf3` are empty features. aarch64 CI is a CPU run.
+
 ## Not operated here
 
-No NVMe format, no DPU mode change, no firmware, no IOMMU or BIOS change, no production network change. Those need a separate authorization. There is no website deploy and no crates.io publish in this milestone.
+No NVMe format, no DPU mode change, no firmware, no IOMMU or BIOS change, no production network change, no hardware purchase. Those need a separate authorization. There is no website deploy and no crates.io publish in this milestone. G4 live calls stay env-gated.

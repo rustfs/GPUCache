@@ -33,6 +33,10 @@ Prefer the hook that already exists in the pinned revision. Switch only if that 
 
 The fault-matrix work did not run the GPU spike. This ADR stays **Pending**. No engine adapter was added.
 
+## V3
+
+The V3 CPU slice did not run the spike and did not add SGLang or HiCache. See [0008-second-engine.md](0008-second-engine.md). This ADR stays **Pending**.
+
 ## Consequences
 
 - Callers must not assume GPUCache can read an arbitrary engine's KV bytes.

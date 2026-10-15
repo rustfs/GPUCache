@@ -24,4 +24,26 @@ Paired baselines use the same prefix-cache idea on both sides when a GPU run exi
 
 There is no `FAIL_PERFORMANCE` figure because there is no paired measurement to fail. Do not add a benchmark that prints a success banner without raw samples, a manifest, and the hardware it ran on. The V2 CPU tests do not fill this gap.
 
+## V3 paired gate
+
+The harness is `cargo run -p gpucache-bench --bin v3-paired`.
+
+The comparison it names is **NIC RDMA baseline vs DPU storage queue**, under the same GPU, model, trace, service behavior, capacity, policy, auth semantics, and SLO. TCP is forbidden as that baseline (`tcp_used_as_dpu_baseline=FORBIDDEN`). A weak TCP number would not be a DPU result. Soft-RoCE, if someone later smokes it on a hypervisor, is not a performance result and must not be copied into this table.
+
+| Row | Result |
+| --- | --- |
+| NIC RDMA baseline | `NOT_RUN_HARDWARE` |
+| DPU storage queue | `NOT_RUN_HARDWARE` |
+| TTFT / TPOT / ITL / SLO goodput | `NOT_RUN_HARDWARE` |
+| Host core-seconds, DPU CPU, DPU DRAM, GPU interference | `NOT_RUN_HARDWARE` |
+| Wire bytes, SSD write amplification, wall power | `NOT_RUN_HARDWARE` |
+| TCO | `TCO_UNKNOWN` |
+| Go gate | `NOT_EVALUATED` |
+| PB-scale | `NOT_CLAIMED` |
+| Production ready | `NOT_CLAIMED` |
+
+Engineering targets, not measurements, and not yet confirmed as the go gate: full cost per million useful output tokens improves by at least ten percent with correctness and SLO held, or an isolation goal that removes a whole x86 box is met without a higher total cost. A twenty percent drop in host core-seconds is only a mechanism signal. It does not by itself prove the cost target. Until a paired run exists the gate stays `NOT_EVALUATED`. A no-go keeps the portable TCP and file backends. This tree does not buy hardware to chase the gate.
+
+Soak of a day or longer, with the fault matrix on real devices, was not run.
+
 Correctness criteria for the CPU path are in [CORRECTNESS.md](CORRECTNESS.md).

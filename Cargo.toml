@@ -6,6 +6,7 @@ members = [
     "crates/storage",
     "crates/cold",
     "crates/transport",
+    "crates/dpu",
     "crates/bench",
 ]
 
@@ -24,6 +25,7 @@ gpucache-protocol = { path = "crates/protocol" }
 gpucache-storage = { path = "crates/storage" }
 gpucache-cold = { path = "crates/cold" }
 gpucache-transport = { path = "crates/transport" }
+gpucache-dpu = { path = "crates/dpu" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

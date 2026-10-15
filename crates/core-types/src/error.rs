@@ -16,6 +16,8 @@ pub enum QuotaKind {
     BatchItems,
     IdempotencyTable,
     PrefixLinks,
+    /// Per-tenant admission rate. Not a durability quota.
+    RateLimit,
 }
 
 /// Recoverable contract failure. Payloads and prompts are never embedded.

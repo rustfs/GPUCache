@@ -1,6 +1,16 @@
 # Third-party notices
 
-GPUCache is Apache-2.0. See [LICENSE](LICENSE). The V2 first slice adds no direct dependency. NIXL (`nixl-sys`, Apache-2.0) and Mooncake (Apache-2.0) were audited and not linked. See [docs/adr/0004-nixl-transport.md](docs/adr/0004-nixl-transport.md).
+GPUCache is Apache-2.0. See [LICENSE](LICENSE). The V2 first slice and the V3 CPU slice add no direct dependency. NIXL (`nixl-sys`, Apache-2.0) and Mooncake (Apache-2.0) were audited and not linked. See [docs/adr/0004-nixl-transport.md](docs/adr/0004-nixl-transport.md).
+
+## DOCA, SPDK, and GDS (not linked)
+
+This tree does not vendor or link DOCA, SPDK, or GDS. Feature `dpu-bf3` has an empty dependency list. No DOCA binary ships with this source tree.
+
+DOCA is NVIDIA software. Its license is NVIDIA's, not Apache-2.0. This change did **not** review the DOCA 3.5 EULA or any performance-disclosure clause, and it does not state a legal conclusion. Before anyone links DOCA or publishes a number from a DOCA run, a human has to read the exact license for the version they installed. Do not assume every NVIDIA hardware result is unpublishable, and do not publish a restricted result. That review is `NOT_RUN_LICENSE` here.
+
+SPDK is a candidate for a future reactor-backed NVMe queue. It is not a dependency. This notice does not pin an SPDX identifier for a version we did not vendor.
+
+No model weights are included. Engine licenses stay out of scope until ADR 0001 selects a route.
 
 Direct dependencies:
 

@@ -9,8 +9,11 @@ use core::fmt;
 
 use gpucache_core_types::CacheError;
 
-use crate::directory::{Admit, FillRequest, ShardDirectory, ShardParams};
-use crate::iface::{rdma_probe, NixlTransport, TcpTransport};
+use crate::directory::{Admit, FillNotice, FillRequest, ShardDirectory, ShardParams};
+use crate::iface::{
+    rdma_probe, submit_preferring_rdma, FallbackReason, HardwarePath, NixlTransport, TcpTransport,
+    TransferDesc, TransportKind,
+};
 use crate::registered::{RegisteredPool, SimCompletion};
 use crate::stage::stage_through_tcp;
 
@@ -24,9 +27,11 @@ impl fmt::Display for ShardReport {
         writeln!(f, "flight=JOINED")?;
         writeln!(f, "credits=SINGLE_CHARGE")?;
         writeln!(f, "stale_epoch=FENCED")?;
+        writeln!(f, "fill_notice=FENCED_NOT_A_HIT")?;
         writeln!(f, "unknown_completion=QUARANTINED")?;
         writeln!(f, "lease_expiry=HELD")?;
         writeln!(f, "tcp_path=HOST_COPY")?;
+        writeln!(f, "rdma_fallback=TCP_CPU_CONTRACT")?;
         writeln!(f, "dma_posted=NO")?;
         writeln!(f, "rdma={rdma}", rdma = rdma_probe())?;
         writeln!(f, "registration=SIMULATED")?;
@@ -78,6 +83,11 @@ pub fn run_shard_demo() -> Result<ShardReport, CacheError> {
     {
         return Err(CacheError::FencingRejected { reason: "epoch" });
     }
+    if dir.fill_notice(&leader_req.tenant, leader_req.request)? != FillNotice::Fenced
+        || dir.fill_notice(&joined_req.tenant, joined_req.request)? != FillNotice::Fenced
+    {
+        return Err(CacheError::FencingRejected { reason: "epoch" });
+    }
 
     let mut pool = RegisteredPool::new(1, 16)?;
     let batch = pool.checkout_batch(1)?;
@@ -101,6 +111,17 @@ pub fn run_shard_demo() -> Result<ShardReport, CacheError> {
             reason: "rdma not linked",
         });
     }
+    let fallback = submit_preferring_rdma(&mut tcp, &TransferDesc { bytes: b"fallback" })?;
+    if fallback.attempted != TransportKind::RdmaNixl
+        || fallback.kind != TransportKind::Tcp
+        || fallback.fallback != FallbackReason::RdmaNotLinked
+        || fallback.dma_posted
+        || fallback.hardware != HardwarePath::CpuContract
+    {
+        return Err(CacheError::Storage {
+            reason: "rdma not linked",
+        });
+    }
     Ok(ShardReport)
 }
 
@@ -115,6 +136,8 @@ mod tests {
         assert!(text.contains("topology=SINGLE_SHARD"));
         assert!(text.contains("rdma=NOT_RUN_HARDWARE"));
         assert!(text.contains("registration=SIMULATED"));
+        assert!(text.contains("fill_notice=FENCED_NOT_A_HIT"));
+        assert!(text.contains("rdma_fallback=TCP_CPU_CONTRACT"));
         assert!(text.contains("dma_posted=NO"));
         assert!(!text.contains("GB/s"));
         assert!(!text.contains("TTFT"));

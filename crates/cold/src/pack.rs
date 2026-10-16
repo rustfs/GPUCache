@@ -10,7 +10,9 @@ const OBJECT_MAGIC: &[u8; 4] = b"GPKG";
 const MANIFEST_MAGIC: &[u8; 4] = b"GPMF";
 const OBJECT_VERSION: u16 = 1;
 /// Manifest layout this crate will read. Any other version is a miss.
-pub const MANIFEST_VERSION: u16 = 1;
+/// Version 2 records the tenant on each range so a refill can reject another
+/// tenant before downloading the payload.
+pub const MANIFEST_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -32,6 +34,9 @@ pub struct PayloadRange {
     pub offset: u64,
     pub length: u64,
     pub checksum: Checksum,
+    /// Tenant that owns this generation. A refill for a different tenant must
+    /// not return the payload.
+    pub tenant: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +72,19 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
         return Err(CacheError::Malformed { reason: "cold key" });
     }
     let mut records = Vec::with_capacity(blocks.len());
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
+        if blocks[..index]
+            .iter()
+            .any(|earlier| earlier.generation == block.generation)
+        {
+            return Err(CacheError::Malformed {
+                reason: "cold pack",
+            });
+        }
+        let tenant = block.identity.tenant.as_bytes();
+        if tenant.is_empty() || tenant.len() > 128 {
+            return Err(CacheError::Malformed { reason: "cold key" });
+        }
         verify_checksum(&block.payload, block.checksum)?;
         if block.payload.len() > HARD_BYTES_CAP {
             return Err(CacheError::ObjectTooLarge {
@@ -75,14 +92,14 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
                 actual: block.payload.len() as u64,
             });
         }
-        records.push((block, block.identity.to_bytes()?));
+        records.push((block, block.identity.to_bytes()?, tenant.to_vec()));
     }
     let mut object = ByteWriter::with_capacity(64);
     object.raw(OBJECT_MAGIC);
     object.u16(OBJECT_VERSION);
     object.u32(u32::try_from(records.len()).unwrap_or(u32::MAX));
     let mut ranges = Vec::with_capacity(records.len());
-    for (block, identity) in &records {
+    for (block, identity, tenant) in &records {
         object.u64(block.generation);
         object.raw(&block.checksum.0);
         object.bytes(identity)?;
@@ -93,6 +110,7 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
             offset: offset as u64,
             length: block.payload.len() as u64,
             checksum: block.checksum,
+            tenant: tenant.clone(),
         });
     }
     let object_bytes = object.finish();
@@ -110,6 +128,7 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
         manifest.u64(range.offset);
         manifest.u64(range.length);
         manifest.raw(&range.checksum.0);
+        manifest.bytes(&range.tenant)?;
     }
     Ok(Pack {
         object_key,
@@ -221,6 +240,7 @@ pub fn read_manifest(bytes: &[u8]) -> Result<Manifest, CacheError> {
             offset: r.u64()?,
             length: r.u64()?,
             checksum: Checksum(r.array32()?),
+            tenant: r.bytes(128)?.to_vec(),
         });
     }
     r.finish()?;
@@ -262,14 +282,26 @@ mod tests {
             MANIFEST_VERSION
         );
         let mut bad = pack.manifest_bytes.clone();
-        bad[4] = 2;
+        bad[4] = 9;
         bad[5] = 0;
-        assert_eq!(manifest_version(&bad).unwrap(), 2);
+        assert_eq!(manifest_version(&bad).unwrap(), 9);
         assert!(matches!(
             read_manifest(&bad),
             Err(CacheError::Storage {
                 reason: "store corrupt"
             })
         ));
+    }
+
+    #[test]
+    fn duplicate_generation_is_rejected() {
+        let mut blocks = sample_blocks().unwrap();
+        blocks[1].generation = blocks[0].generation;
+        assert_eq!(
+            pack_blocks("dup", &blocks).unwrap_err(),
+            CacheError::Malformed {
+                reason: "cold pack"
+            }
+        );
     }
 }

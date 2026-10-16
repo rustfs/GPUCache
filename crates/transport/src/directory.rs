@@ -7,9 +7,11 @@
 //! id 0. The map is keyed by the SHA-256 of a physical byte key, one entry
 //! per in-flight fill, not per token. Membership changes bump the epoch and
 //! drop in-flight fills. There is no cross-shard quorum and no payload store.
-//! Credits are an admission limit, not a replica set.
+//! Credits are an admission limit, not a replica set. A finished, failed, or
+//! fenced fill leaves a bounded notice. That notice is not a hit and carries
+//! no bytes. An epoch that cannot advance does not drop in-flight work.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use gpucache_core_types::{content_checksum, CacheError, QuotaKind, HARD_BYTES_CAP};
 
@@ -74,6 +76,18 @@ pub enum Admit {
     Joined { flight_id: u64, epoch: u64 },
 }
 
+/// Observable end of one fill. None of these variants carries payload bytes.
+/// `LeaderFinished` is not a cache hit: the caller still has to `Get` a
+/// committed block or recompute. A missing notice is [`CacheError::UnknownGeneration`],
+/// which is also a recompute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillNotice {
+    Pending,
+    LeaderFinished,
+    LeaderFailed,
+    Fenced,
+}
+
 struct Flight {
     id: u64,
     epoch: u64,
@@ -98,6 +112,9 @@ pub struct ShardDirectory {
     max_waiters: usize,
     max_members: usize,
     next_flight: u64,
+    notices: BTreeMap<(Vec<u8>, [u8; 16]), FillNotice>,
+    notice_order: VecDeque<(Vec<u8>, [u8; 16])>,
+    max_notices: usize,
 }
 
 impl ShardDirectory {
@@ -126,6 +143,12 @@ impl ShardDirectory {
             max_waiters: params.max_waiters,
             max_members: params.max_members,
             next_flight: 1,
+            notices: BTreeMap::new(),
+            notice_order: VecDeque::new(),
+            max_notices: params
+                .max_flights
+                .saturating_mul(params.max_waiters.saturating_add(1))
+                .max(1),
         }
     }
 
@@ -151,7 +174,9 @@ impl ShardDirectory {
 
     /// Drop in-flight fills and bump the epoch. Credits return to the pool.
     /// Callers must treat the dropped fills as misses. This is not a copy.
-    pub fn fence_epoch(&mut self) -> u64 {
+    /// When the epoch cannot advance, in-flight fills stay and the error is
+    /// returned instead.
+    pub fn fence_epoch(&mut self) -> Result<u64, CacheError> {
         self.fence_inflight()
     }
 
@@ -184,19 +209,21 @@ impl ShardDirectory {
             if incarnation < self.members[pos].incarnation {
                 return Err(CacheError::FencingRejected { reason: "member" });
             }
+            self.ensure_epoch_can_advance()?;
             self.members[pos].incarnation = incarnation;
-            return Ok(self.fence_inflight());
+            return self.fence_inflight();
         }
         if self.members.len() >= self.max_members {
             return Err(CacheError::Malformed {
                 reason: "membership",
             });
         }
+        self.ensure_epoch_can_advance()?;
         self.members.push(MemberView {
             node_id,
             incarnation,
         });
-        Ok(self.fence_inflight())
+        self.fence_inflight()
     }
 
     pub fn remove_member(&mut self, node_id: u64) -> Result<u64, CacheError> {
@@ -212,8 +239,9 @@ impl ShardDirectory {
         if self.members.len() == 1 {
             return Err(CacheError::FencingRejected { reason: "member" });
         }
+        self.ensure_epoch_can_advance()?;
         self.members.remove(pos);
-        Ok(self.fence_inflight())
+        self.fence_inflight()
     }
 
     pub fn begin_or_join(&mut self, req: &FillRequest) -> Result<Admit, CacheError> {
@@ -292,7 +320,12 @@ impl ShardDirectory {
         request_epoch: u64,
         request: [u8; 16],
     ) -> Result<(), CacheError> {
-        self.finish(flight_id, request_epoch, request)
+        self.finish(
+            flight_id,
+            request_epoch,
+            request,
+            FillNotice::LeaderFinished,
+        )
     }
 
     pub fn fail_flight(
@@ -301,7 +334,20 @@ impl ShardDirectory {
         request_epoch: u64,
         request: [u8; 16],
     ) -> Result<(), CacheError> {
-        self.finish(flight_id, request_epoch, request)
+        self.finish(flight_id, request_epoch, request, FillNotice::LeaderFailed)
+    }
+
+    /// Status of one leader or joiner. In-flight work is `Pending`. A terminal
+    /// notice is not a payload. An evicted or unknown request is not a hit.
+    pub fn fill_notice(&self, tenant: &[u8], request: [u8; 16]) -> Result<FillNotice, CacheError> {
+        let key = (tenant.to_vec(), request);
+        if self.by_request.contains_key(&key) {
+            return Ok(FillNotice::Pending);
+        }
+        self.notices
+            .get(&key)
+            .copied()
+            .ok_or(CacheError::UnknownGeneration)
     }
 
     fn finish(
@@ -309,6 +355,7 @@ impl ShardDirectory {
         flight_id: u64,
         request_epoch: u64,
         request: [u8; 16],
+        notice: FillNotice,
     ) -> Result<(), CacheError> {
         self.check_epoch(request_epoch)?;
         let Some(key) = self.by_id.get(&flight_id).copied() else {
@@ -326,21 +373,59 @@ impl ShardDirectory {
             .ok_or(CacheError::UnknownGeneration)?;
         self.by_id.remove(&flight_id);
         self.by_request.remove(&(tenant.clone(), flight.leader));
+        self.record_notice(tenant.clone(), flight.leader, notice);
         for waiter in flight.waiters {
             self.by_request.remove(&(tenant.clone(), waiter));
+            self.record_notice(tenant.clone(), waiter, notice);
         }
         self.release(&tenant, bytes)
     }
 
-    fn fence_inflight(&mut self) -> u64 {
-        self.epoch = self.epoch.saturating_add(1);
+    fn fence_inflight(&mut self) -> Result<u64, CacheError> {
+        let next = self.epoch.checked_add(1).ok_or(CacheError::QuotaExceeded {
+            kind: QuotaKind::InFlightRequests,
+        })?;
+        self.epoch = next;
         self.by_request.clear();
         self.by_id.clear();
         let flights = std::mem::take(&mut self.flights);
         for (_, flight) in flights {
+            self.record_notice(flight.tenant.clone(), flight.leader, FillNotice::Fenced);
+            for waiter in &flight.waiters {
+                self.record_notice(flight.tenant.clone(), *waiter, FillNotice::Fenced);
+            }
             let _ = self.release(&flight.tenant, flight.bytes);
         }
-        self.epoch
+        Ok(self.epoch)
+    }
+
+    fn ensure_epoch_can_advance(&self) -> Result<(), CacheError> {
+        if self.epoch == u64::MAX {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests,
+            });
+        }
+        Ok(())
+    }
+
+    fn record_notice(&mut self, tenant: Vec<u8>, request: [u8; 16], notice: FillNotice) {
+        let key = (tenant, request);
+        if self.notices.contains_key(&key) {
+            self.notice_order.retain(|existing| existing != &key);
+        }
+        self.notices.insert(key.clone(), notice);
+        self.notice_order.push_back(key);
+        while self.notices.len() > self.max_notices {
+            let Some(old) = self.notice_order.pop_front() else {
+                break;
+            };
+            self.notices.remove(&old);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_epoch_for_test(&mut self, epoch: u64) {
+        self.epoch = epoch;
     }
 
     fn reserve(&mut self, tenant: &[u8], bytes: u64) -> Result<(), CacheError> {
@@ -619,7 +704,7 @@ mod tests {
                     .fail_flight(flight_id, epoch, 1u128.to_le_bytes())
                     .unwrap(),
                 _ => {
-                    dir.fence_epoch();
+                    dir.fence_epoch().unwrap();
                 }
             }
             assert!(dir.by_request.is_empty());
@@ -640,5 +725,152 @@ mod tests {
         );
         assert_eq!(dir.epoch(), epoch);
         assert_eq!(dir.inflight(), 1);
+    }
+
+    #[test]
+    fn finish_and_failure_are_notices_without_bytes_and_a_fence_is_not_success() {
+        let mut dir = ShardDirectory::single_node(params());
+        let leader = dir
+            .begin_or_join(&fill(b"phys-a", b"tenant-a", 10, 1, 1))
+            .unwrap();
+        dir.begin_or_join(&fill(b"phys-a", b"tenant-a", 10, 2, 1))
+            .unwrap();
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 2u128.to_le_bytes()).unwrap(),
+            FillNotice::Pending
+        );
+        let Admit::Leader { flight_id, .. } = leader else {
+            panic!("leader");
+        };
+        dir.fail_flight(flight_id, 1, 1u128.to_le_bytes()).unwrap();
+        assert_eq!(dir.inflight(), 0);
+        assert_eq!(dir.credits_used(), 0);
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 1u128.to_le_bytes()).unwrap(),
+            FillNotice::LeaderFailed
+        );
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 2u128.to_le_bytes()).unwrap(),
+            FillNotice::LeaderFailed
+        );
+        let again = dir
+            .begin_or_join(&fill(b"phys-b", b"tenant-a", 10, 3, 1))
+            .unwrap();
+        let Admit::Leader { flight_id, .. } = again else {
+            panic!("leader");
+        };
+        dir.begin_or_join(&fill(b"phys-b", b"tenant-a", 10, 4, 1))
+            .unwrap();
+        dir.complete_flight(flight_id, 1, 3u128.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 4u128.to_le_bytes()).unwrap(),
+            FillNotice::LeaderFinished
+        );
+        assert_eq!(dir.credits_used(), 0);
+        let fenced = dir
+            .begin_or_join(&fill(b"phys-c", b"tenant-a", 10, 5, 1))
+            .unwrap();
+        dir.begin_or_join(&fill(b"phys-c", b"tenant-a", 10, 6, 1))
+            .unwrap();
+        let Admit::Leader { flight_id, epoch } = fenced else {
+            panic!("leader");
+        };
+        dir.fence_epoch().unwrap();
+        assert_eq!(
+            dir.complete_flight(flight_id, epoch, 5u128.to_le_bytes())
+                .unwrap_err(),
+            CacheError::EpochMismatch {
+                store: 2,
+                request: 1,
+            }
+        );
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 5u128.to_le_bytes()).unwrap(),
+            FillNotice::Fenced
+        );
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 6u128.to_le_bytes()).unwrap(),
+            FillNotice::Fenced
+        );
+        assert_ne!(
+            dir.fill_notice(b"tenant-a", 5u128.to_le_bytes()).unwrap(),
+            FillNotice::LeaderFinished
+        );
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 9u128.to_le_bytes())
+                .unwrap_err(),
+            CacheError::UnknownGeneration
+        );
+    }
+
+    #[test]
+    fn notice_table_drops_the_oldest_instead_of_growing() {
+        let mut dir = ShardDirectory::single_node(ShardParams::new(100, 100, 1, 1, 2).unwrap());
+        assert_eq!(dir.max_notices, 2);
+        for request in 1u128..=3 {
+            let epoch = dir.epoch();
+            let Admit::Leader { flight_id, .. } = dir
+                .begin_or_join(&fill(b"phys", b"tenant-a", 10, request, epoch))
+                .unwrap()
+            else {
+                panic!("leader");
+            };
+            dir.complete_flight(flight_id, epoch, request.to_le_bytes())
+                .unwrap();
+        }
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 1u128.to_le_bytes())
+                .unwrap_err(),
+            CacheError::UnknownGeneration
+        );
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 3u128.to_le_bytes()).unwrap(),
+            FillNotice::LeaderFinished
+        );
+        assert_eq!(dir.notices.len(), 2);
+    }
+
+    #[test]
+    fn epoch_overflow_does_not_drop_the_fill_or_publish_a_new_member() {
+        let mut dir = ShardDirectory::single_node(params());
+        dir.set_epoch_for_test(u64::MAX);
+        let admit = dir
+            .begin_or_join(&fill(b"phys-a", b"tenant-a", 10, 1, u64::MAX))
+            .unwrap();
+        let Admit::Leader { flight_id, .. } = admit else {
+            panic!("leader");
+        };
+        let err = dir.note_member(1, 2).unwrap_err();
+        assert_eq!(
+            err,
+            CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests,
+            }
+        );
+        assert_eq!(dir.epoch(), u64::MAX);
+        assert_eq!(dir.inflight(), 1);
+        assert_eq!(dir.credits_used(), 10);
+        assert_eq!(dir.members()[0].incarnation, 1);
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 1u128.to_le_bytes()).unwrap(),
+            FillNotice::Pending
+        );
+        let err = dir.fence_epoch().unwrap_err();
+        assert_eq!(
+            err,
+            CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests,
+            }
+        );
+        assert_eq!(dir.inflight(), 1);
+        dir.complete_flight(flight_id, u64::MAX, 1u128.to_le_bytes())
+            .unwrap();
+        assert_eq!(dir.inflight(), 0);
+        assert_eq!(dir.credits_used(), 0);
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 1u128.to_le_bytes()).unwrap(),
+            FillNotice::LeaderFinished
+        );
     }
 }

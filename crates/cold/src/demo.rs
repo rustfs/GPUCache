@@ -12,7 +12,9 @@ use gpucache_core_types::{content_checksum, synthetic_identity, CacheError};
 
 use crate::http::{live_probe, ProbeStatus};
 use crate::pack::{contract_smoke, pack_blocks, PackedBlock};
-use crate::sink::{refill_generation, AsyncSink, ColdJob, RefillBudget, RefillOutcome};
+use crate::sink::{
+    refill_generation, refill_matching, AsyncSink, ColdJob, RefillBudget, RefillOutcome,
+};
 use crate::MockObjectStore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +29,7 @@ impl fmt::Display for ColdReport {
         writeln!(f, "async_sink=DRAINED")?;
         writeln!(f, "refill=CHECKSUM_OK")?;
         writeln!(f, "over_budget=NO_BYTES")?;
+        writeln!(f, "wrong_tenant=NO_BYTES")?;
         writeln!(f, "rustfs_live={}", self.live)?;
         writeln!(f, "gds=NOT_RUN_HARDWARE")?;
         Ok(())
@@ -57,6 +60,14 @@ pub fn run_cold_demo() -> Result<ColdReport, CacheError> {
         return Err(CacheError::Malformed {
             reason: "refill budget",
         });
+    }
+    let tenant = blocks[1].identity.tenant.as_bytes();
+    match refill_matching(&store, &pack.manifest_key, 2, &budget, tenant)? {
+        RefillOutcome::Loaded { payload } if payload == blocks[1].payload => {}
+        _ => return Err(CacheError::ChecksumMismatch),
+    }
+    if refill_matching(&store, &pack.manifest_key, 2, &budget, b"other-tenant").is_ok() {
+        return Err(CacheError::Unauthorized);
     }
     let live = match live_probe().status {
         ProbeStatus::NotRunHardware { .. } => "NOT_RUN_HARDWARE",
@@ -96,6 +107,7 @@ mod tests {
         let text = report.to_string();
         assert!(text.contains("status=COLD_CONTRACT_OK"));
         assert!(text.contains("over_budget=NO_BYTES"));
+        assert!(text.contains("wrong_tenant=NO_BYTES"));
         assert!(text.contains("gds=NOT_RUN_HARDWARE"));
         if std::env::var_os("GPUCACHE_RUSTFS_ENDPOINT").is_none() {
             assert!(text.contains("rustfs_live=NOT_RUN_HARDWARE"));

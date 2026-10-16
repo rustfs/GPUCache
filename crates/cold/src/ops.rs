@@ -43,6 +43,22 @@ pub enum ColdAvailability {
     Unavailable,
 }
 
+pub fn refill_for_tenant(
+    store: &dyn ObjectStore,
+    manifest_key: &str,
+    generation: u64,
+    budget: &RefillBudget,
+    availability: ColdAvailability,
+    tenant: &[u8],
+) -> Result<RefillOutcome, CacheError> {
+    match availability {
+        ColdAvailability::Slow | ColdAvailability::Unavailable => Ok(RefillOutcome::Missing),
+        ColdAvailability::Ready => {
+            crate::sink::refill_matching(store, manifest_key, generation, budget, tenant)
+        }
+    }
+}
+
 pub fn refill_degraded(
     store: &dyn ObjectStore,
     manifest_key: &str,
@@ -434,7 +450,7 @@ mod tests {
         let mut ops = ColdOps::new(Retention::new(10).unwrap());
         let generation = ops.keys_mut().issue(b"tenant-b").unwrap();
         let mut bad = record("ns/object", generation, 0);
-        bad.manifest_version = 2;
+        bad.manifest_version = 9;
         assert!(ops.record_put(bad).is_err());
     }
 
@@ -475,5 +491,43 @@ mod tests {
             assert_eq!(outcome, RefillOutcome::Missing);
         }
         assert!(store.head("ns/manifest").is_ok());
+    }
+
+    struct ClosedStore;
+
+    impl ObjectStore for ClosedStore {
+        fn put(&mut self, _key: &str, _body: &[u8]) -> Result<(), CacheError> {
+            Err(CacheError::Storage {
+                reason: "object store",
+            })
+        }
+        fn head(&self, _key: &str) -> Result<crate::pack::ObjectMeta, CacheError> {
+            Err(CacheError::Storage {
+                reason: "object store",
+            })
+        }
+        fn range_get(&self, _key: &str, _offset: u64, _length: u64) -> Result<Vec<u8>, CacheError> {
+            Err(CacheError::Storage {
+                reason: "object store",
+            })
+        }
+        fn delete(&mut self, _key: &str) -> Result<(), CacheError> {
+            Err(CacheError::Storage {
+                reason: "object store",
+            })
+        }
+    }
+
+    #[test]
+    fn degraded_tenant_refill_does_not_touch_the_store() {
+        let budget = RefillBudget::new(64, 1).unwrap();
+        let store = ClosedStore;
+        for availability in [ColdAvailability::Slow, ColdAvailability::Unavailable] {
+            assert_eq!(
+                refill_for_tenant(&store, "ns/manifest", 1, &budget, availability, b"tenant-a")
+                    .unwrap(),
+                RefillOutcome::Missing
+            );
+        }
     }
 }

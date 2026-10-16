@@ -24,6 +24,8 @@ Paired baselines use the same prefix-cache idea on both sides when a GPU run exi
 
 There is no `FAIL_PERFORMANCE` figure because there is no paired measurement to fail. Do not add a benchmark that prints a success banner without raw samples, a manifest, and the hardware it ran on. The V2 CPU tests do not fill this gap.
 
+Mooncake's published transfer and serving figures are not rows in this table. `paired-baseline` prints `mooncake_transfer_engine=NOT_LINKED` and `mooncake_published_numbers=NOT_REPRODUCED`. Those lines are labels. They are not a reproduction and they contain no sample. See [MOONCAKE.md](MOONCAKE.md).
+
 ## V3 paired gate
 
 The harness is `cargo run -p gpucache-bench --bin v3-paired`.
@@ -38,6 +40,7 @@ The comparison it names is **NIC RDMA baseline vs DPU storage queue**, under the
 | Host core-seconds, DPU CPU, DPU DRAM, GPU interference | `NOT_RUN_HARDWARE` |
 | Wire bytes, SSD write amplification, wall power | `NOT_RUN_HARDWARE` |
 | TCO | `TCO_UNKNOWN` |
+| Mooncake RDMA | `NOT_A_PERFORMANCE_RESULT`. Not linked, and not a stand-in for the NIC RDMA baseline |
 | Go gate | `NOT_EVALUATED` |
 | PB-scale | `NOT_CLAIMED` |
 | Production ready | `NOT_CLAIMED` |

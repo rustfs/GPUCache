@@ -30,6 +30,9 @@ pub fn paired_baseline_report() -> String {
         "samples=NONE",
         "numeric_tolerance=NOT_APPLICABLE",
         "bypass_when_no_reuse=MISS_RECOMPUTE",
+        "mooncake_transfer_engine=NOT_LINKED",
+        "mooncake_published_numbers=NOT_REPRODUCED",
+        "rdma_fallback=TCP_CPU_CONTRACT",
     ];
     let mut out = String::new();
     for line in lines {
@@ -73,6 +76,7 @@ pub fn v3_paired_report() -> String {
         "pb_scale=NOT_CLAIMED",
         "production_ready=NOT_CLAIMED",
         "soft_roce=NOT_A_PERFORMANCE_RESULT",
+        "mooncake_rdma=NOT_A_PERFORMANCE_RESULT",
     ];
     let mut out = String::new();
     for line in lines {
@@ -108,6 +112,9 @@ mod tests {
             "tpot=NOT_RUN_HARDWARE",
             "goodput=NOT_RUN_HARDWARE",
             "samples=NONE",
+            "mooncake_transfer_engine=NOT_LINKED",
+            "mooncake_published_numbers=NOT_REPRODUCED",
+            "rdma_fallback=TCP_CPU_CONTRACT",
         ] {
             assert!(report.contains(key), "missing {key}");
         }
@@ -129,6 +136,7 @@ mod tests {
             "pb_scale=NOT_CLAIMED",
             "production_ready=NOT_CLAIMED",
             "soft_roce=NOT_A_PERFORMANCE_RESULT",
+            "mooncake_rdma=NOT_A_PERFORMANCE_RESULT",
         ] {
             assert!(report.contains(key), "missing {key}");
         }

@@ -128,7 +128,8 @@ impl AsyncSink {
 
     /// Put at most `max_jobs` queued packs. The object is written first, then
     /// the manifest, so a manifest is not visible without its object. A
-    /// failed manifest write deletes the object just written.
+    /// failed object or manifest write puts that job back at the front of the
+    /// queue. A failed manifest write also deletes the object just written.
     pub fn drain(
         &mut self,
         store: &mut dyn ObjectStore,
@@ -142,15 +143,25 @@ impl AsyncSink {
             let Some(job) = self.queue.pop_front() else {
                 break;
             };
-            self.queued_bytes = self.queued_bytes.saturating_sub(job.weight());
-            store.put(&job.object_key, &job.object_bytes)?;
+            let weight = job.weight();
+            self.queued_bytes = self.queued_bytes.saturating_sub(weight);
+            if let Err(err) = store.put(&job.object_key, &job.object_bytes) {
+                self.requeue_front(job);
+                return Err(err);
+            }
             if let Err(err) = store.put(&job.manifest_key, &job.manifest_bytes) {
                 let _ = store.delete(&job.object_key);
+                self.requeue_front(job);
                 return Err(err);
             }
             done = done.saturating_add(1);
         }
         Ok(done)
+    }
+
+    fn requeue_front(&mut self, job: ColdJob) {
+        self.queued_bytes = self.queued_bytes.saturating_add(job.weight());
+        self.queue.push_front(job);
     }
 
     /// Drop queued work. Later enqueue and drain fail with `Cancelled`.
@@ -165,11 +176,39 @@ impl AsyncSink {
 ///
 /// The manifest is not downloaded when its length exceeds the budget. The
 /// payload range is not downloaded when its length exceeds the budget.
+/// This path checks the payload checksum. It does not check the tenant.
+/// Call [`refill_matching`] when a wrong tenant must not return bytes.
 pub fn refill_generation(
     store: &dyn ObjectStore,
     manifest_key: &str,
     generation: u64,
     budget: &RefillBudget,
+) -> Result<RefillOutcome, CacheError> {
+    refill_inner(store, manifest_key, generation, budget, None)
+}
+
+/// Same budget rules as [`refill_generation`], plus the tenant recorded on
+/// the manifest range. A mismatch is [`CacheError::Unauthorized`] and does
+/// not download the payload.
+pub fn refill_matching(
+    store: &dyn ObjectStore,
+    manifest_key: &str,
+    generation: u64,
+    budget: &RefillBudget,
+    tenant: &[u8],
+) -> Result<RefillOutcome, CacheError> {
+    if tenant.is_empty() || tenant.len() > 128 {
+        return Err(CacheError::Malformed { reason: "cold key" });
+    }
+    refill_inner(store, manifest_key, generation, budget, Some(tenant))
+}
+
+fn refill_inner(
+    store: &dyn ObjectStore,
+    manifest_key: &str,
+    generation: u64,
+    budget: &RefillBudget,
+    tenant: Option<&[u8]>,
 ) -> Result<RefillOutcome, CacheError> {
     if !key_ok(manifest_key) {
         return Err(CacheError::Malformed { reason: "cold key" });
@@ -200,6 +239,11 @@ pub fn refill_generation(
     else {
         return Ok(RefillOutcome::Missing);
     };
+    if let Some(expected) = tenant {
+        if range.tenant.as_slice() != expected {
+            return Err(CacheError::Unauthorized);
+        }
+    }
     if range.length == 0 || range.length > budget.max_bytes.saturating_sub(meta.len) {
         return Ok(RefillOutcome::OverBudget);
     }
@@ -382,6 +426,112 @@ mod tests {
             .unwrap(),
             RefillOutcome::Loaded { .. }
         ));
+        assert_eq!(store.object_ranges.get(), 1);
+    }
+
+    struct FailStore {
+        inner: MockObjectStore,
+        fail_object: bool,
+        fail_manifest: bool,
+    }
+
+    impl ObjectStore for FailStore {
+        fn put(&mut self, key: &str, body: &[u8]) -> Result<(), CacheError> {
+            if key.ends_with("/object") && self.fail_object {
+                return Err(CacheError::Storage {
+                    reason: "object store",
+                });
+            }
+            if key.ends_with("/manifest") && self.fail_manifest {
+                return Err(CacheError::Storage {
+                    reason: "object store",
+                });
+            }
+            self.inner.put(key, body)
+        }
+
+        fn head(&self, key: &str) -> Result<crate::ObjectMeta, CacheError> {
+            self.inner.head(key)
+        }
+
+        fn range_get(&self, key: &str, offset: u64, length: u64) -> Result<Vec<u8>, CacheError> {
+            self.inner.range_get(key, offset, length)
+        }
+
+        fn delete(&mut self, key: &str) -> Result<(), CacheError> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn failed_drain_keeps_the_job_and_hides_a_partial_object() {
+        let blocks = vec![block(1, 7, 8), block(2, 8, 8)];
+        let pack = pack_blocks("retry", &blocks).unwrap();
+        let mut sink = AsyncSink::new(2, 8 * 1024 * 1024).unwrap();
+        sink.enqueue(ColdJob::from_pack(&pack)).unwrap();
+        let queued_bytes = sink.queued_bytes;
+        let mut store = FailStore {
+            inner: MockObjectStore::default(),
+            fail_object: true,
+            fail_manifest: false,
+        };
+        assert_eq!(
+            sink.drain(&mut store, 1).unwrap_err(),
+            CacheError::Storage {
+                reason: "object store"
+            }
+        );
+        assert_eq!(sink.queued(), 1);
+        assert_eq!(sink.queued_bytes, queued_bytes);
+        assert!(store.head(&pack.object_key).is_err());
+        store.fail_object = false;
+        store.fail_manifest = true;
+        assert_eq!(
+            sink.drain(&mut store, 1).unwrap_err(),
+            CacheError::Storage {
+                reason: "object store"
+            }
+        );
+        assert_eq!(sink.queued(), 1);
+        assert!(store.head(&pack.object_key).is_err());
+        assert!(store.head(&pack.manifest_key).is_err());
+        store.fail_manifest = false;
+        assert_eq!(sink.drain(&mut store, 1).unwrap(), 1);
+        assert_eq!(sink.queued(), 0);
+        assert!(store.head(&pack.manifest_key).is_ok());
+    }
+
+    #[test]
+    fn wrong_tenant_refill_does_not_download_the_payload() {
+        let pack = pack_blocks("tenant", &[block(1, 1, 32)]).unwrap();
+        let mut store = CountStore {
+            inner: MockObjectStore::default(),
+            manifest_ranges: Cell::new(0),
+            object_ranges: Cell::new(0),
+        };
+        store.put(&pack.manifest_key, &pack.manifest_bytes).unwrap();
+        store.put(&pack.object_key, &pack.object_bytes).unwrap();
+        let budget = RefillBudget::new(8 * 1024 * 1024, 4).unwrap();
+        assert_eq!(
+            refill_matching(&store, &pack.manifest_key, 1, &budget, b"other-tenant").unwrap_err(),
+            CacheError::Unauthorized
+        );
+        assert_eq!(store.manifest_ranges.get(), 1);
+        assert_eq!(store.object_ranges.get(), 0);
+        let loaded = refill_matching(
+            &store,
+            &pack.manifest_key,
+            1,
+            &budget,
+            pack.ranges[0].tenant.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded,
+            RefillOutcome::Loaded {
+                payload: vec![1u8; 32],
+            }
+        );
         assert_eq!(store.object_ranges.get(), 1);
     }
 }

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use gpucache_core_types::CacheError;
 
-use crate::directory::{Admit, FillRequest, ShardDirectory, ShardParams};
+use crate::directory::{Admit, FillNotice, FillRequest, ShardDirectory, ShardParams};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -88,6 +88,10 @@ impl ControlPlane {
         self.dir.complete_flight(flight_id, request_epoch, request)
     }
 
+    pub fn fill_notice(&self, tenant: &[u8], request: [u8; 16]) -> Result<FillNotice, CacheError> {
+        self.dir.fill_notice(tenant, request)
+    }
+
     pub fn assign_domain(&mut self, node_id: u64, domain: u16) -> Result<(), CacheError> {
         if !self
             .dir
@@ -140,7 +144,7 @@ impl ControlPlane {
                 reason: "rebalance",
             });
         }
-        let source_epoch = self.dir.fence_epoch();
+        let source_epoch = self.dir.fence_epoch()?;
         let destination = ShardDirectory::open(to_shard, self.params.clone());
         Ok(RebalancePlan {
             from_shard: self.dir.shard_id(),
@@ -162,7 +166,7 @@ impl ControlPlane {
         if self.phase != Phase::Draining {
             return Err(CacheError::Malformed { reason: "upgrade" });
         }
-        let epoch = self.dir.fence_epoch();
+        let epoch = self.dir.fence_epoch()?;
         self.software_generation = self.software_generation.saturating_add(1);
         self.upgraded = true;
         self.phase = Phase::Serving;
@@ -188,7 +192,7 @@ impl ControlPlane {
         if !self.upgraded {
             return Err(CacheError::Malformed { reason: "upgrade" });
         }
-        let epoch = self.dir.fence_epoch();
+        let epoch = self.dir.fence_epoch()?;
         Ok(UpgradeStamp {
             generation: self.software_generation,
             epoch,
@@ -234,6 +238,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CacheError::EpochMismatch { .. }));
         assert_eq!(plan.source_epoch, plane.epoch());
+        assert_eq!(
+            plane.fill_notice(b"tenant-a", 1u128.to_le_bytes()).unwrap(),
+            FillNotice::Fenced
+        );
     }
 
     #[test]

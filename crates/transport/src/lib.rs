@@ -26,11 +26,11 @@ mod stage;
 
 pub use client::TcpClient;
 pub use demo::{run_share_demo, ShareReport};
-pub use directory::{Admit, FillRequest, MemberView, ShardDirectory, ShardParams};
+pub use directory::{Admit, FillNotice, FillRequest, MemberView, ShardDirectory, ShardParams};
 pub use fault_demo::{run_fault_demo, FaultReport};
 pub use iface::{
-    rdma_feature_selected, rdma_probe, HardwarePath, KvTransport, NixlTransport, TcpTransport,
-    TransferDesc, TransferReceipt, TransportKind,
+    rdma_feature_selected, rdma_probe, submit_preferring_rdma, FallbackReason, HardwarePath,
+    KvTransport, NixlTransport, TcpTransport, TransferDesc, TransferReceipt, TransportKind,
 };
 pub use plane::{ControlPlane, RebalancePlan, UpgradeStamp};
 pub use rate::RateGate;

@@ -4,9 +4,10 @@
 //! Bounded buffer pool that *simulates* pin/registration.
 //!
 //! Slots are ordinary `Vec<u8>` allocations. Nothing here calls `ibv_reg_mr`
-//! or a NIC. Unknown completion quarantines a slot. Lease expiry does not
-//! free it. A new region id is assigned only when an allocation is bound
-//! again; retired ids are not recycled.
+//! or a NIC. Checkout prefers a slot that already has a binding, and a batch
+//! that cannot be satisfied is left untouched. Unknown completion quarantines
+//! a slot. Lease expiry does not free it. A new region id is assigned only
+//! when an allocation is bound again; retired ids are not recycled.
 
 use gpucache_core_types::{CacheError, QuotaKind};
 
@@ -167,22 +168,13 @@ impl RegisteredPool {
         Ok(())
     }
 
-    /// Take `n` idle slots. Already-bound slots do not count as a new
-    /// registration. The call changes nothing when it returns an error.
+    /// Take `n` idle slots. Already-bound slots are preferred and do not count
+    /// as a new registration. The call changes nothing when it returns an error,
+    /// including when the region-id space cannot cover every new binding.
     pub fn checkout_batch(&mut self, n: usize) -> Result<CheckedBatch, CacheError> {
         if n == 0 || n > self.regions.len() {
             return Err(CacheError::Malformed {
                 reason: "buffer pool",
-            });
-        }
-        let available = self
-            .regions
-            .iter()
-            .filter(|region| matches!(region.state, RegionState::Unbound | RegionState::Idle))
-            .count();
-        if available < n {
-            return Err(CacheError::QuotaExceeded {
-                kind: QuotaKind::Registrations,
             });
         }
         if self.next_batch == u64::MAX {
@@ -190,40 +182,85 @@ impl RegisteredPool {
                 kind: QuotaKind::Registrations,
             });
         }
-        let batch = self.next_batch;
-        self.next_batch += 1;
-        let mut slots = Vec::with_capacity(n);
-        let mut index = 0;
-        while slots.len() < n && index < self.regions.len() {
-            let state = self.regions[index].state;
-            match state {
+        let mut idle = Vec::new();
+        let mut unbound = Vec::new();
+        for (index, region) in self.regions.iter().enumerate() {
+            match region.state {
                 RegionState::Idle => {
-                    self.reused_registrations = self.reused_registrations.saturating_add(1);
+                    if region.id.is_none() {
+                        return Err(CacheError::Storage {
+                            reason: "buffer pool",
+                        });
+                    }
+                    idle.push(index);
+                }
+                RegionState::Unbound => unbound.push(index),
+                RegionState::CheckedOut { .. } | RegionState::Quarantined { .. } => {}
+            }
+        }
+        if idle.len() + unbound.len() < n {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::Registrations,
+            });
+        }
+        let mut chosen = Vec::with_capacity(n);
+        for index in idle {
+            if chosen.len() == n {
+                break;
+            }
+            chosen.push(index);
+        }
+        let fresh = n - chosen.len();
+        let available_ids = u64::MAX - self.next_id;
+        if fresh as u64 > available_ids {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::Registrations,
+            });
+        }
+        for index in unbound.into_iter().take(fresh) {
+            chosen.push(index);
+        }
+
+        let batch = self.next_batch;
+        let mut next_id = self.next_id;
+        let mut planned = Vec::with_capacity(n);
+        for index in chosen {
+            match self.regions[index].state {
+                RegionState::Idle => {
                     let id = self.regions[index].id.ok_or(CacheError::Storage {
                         reason: "buffer pool",
                     })?;
-                    self.regions[index].state = RegionState::CheckedOut { batch };
-                    slots.push(id);
+                    planned.push((index, id, false));
                 }
                 RegionState::Unbound => {
-                    if self.regions[index].had_registration {
-                        self.backing_reused = self.backing_reused.saturating_add(1);
-                    }
-                    let id = self.alloc_id()?;
-                    self.regions[index].id = Some(id);
-                    self.regions[index].had_registration = true;
-                    self.regions[index].state = RegionState::CheckedOut { batch };
-                    self.registration_ops = self.registration_ops.saturating_add(1);
-                    slots.push(id);
+                    let id = SlotId(next_id);
+                    next_id = next_id.saturating_add(1);
+                    planned.push((index, id, true));
                 }
-                RegionState::CheckedOut { .. } | RegionState::Quarantined { .. } => {}
+                RegionState::CheckedOut { .. } | RegionState::Quarantined { .. } => {
+                    return Err(CacheError::Storage {
+                        reason: "buffer pool",
+                    });
+                }
             }
-            index += 1;
         }
-        if slots.len() != n {
-            return Err(CacheError::Storage {
-                reason: "buffer pool",
-            });
+
+        self.next_batch = self.next_batch.saturating_add(1);
+        self.next_id = next_id;
+        let mut slots = Vec::with_capacity(n);
+        for (index, id, is_new) in planned {
+            if is_new {
+                if self.regions[index].had_registration {
+                    self.backing_reused = self.backing_reused.saturating_add(1);
+                }
+                self.regions[index].id = Some(id);
+                self.regions[index].had_registration = true;
+                self.registration_ops = self.registration_ops.saturating_add(1);
+            } else {
+                self.reused_registrations = self.reused_registrations.saturating_add(1);
+            }
+            self.regions[index].state = RegionState::CheckedOut { batch };
+            slots.push(id);
         }
         Ok(CheckedBatch { id: batch, slots })
     }
@@ -272,9 +309,12 @@ impl RegisteredPool {
     }
 
     /// Move in-flight and already-quarantined slots to fenced quarantine.
-    /// Does not free them.
-    pub fn fence_epoch(&mut self) -> u64 {
-        self.epoch = self.epoch.saturating_add(1);
+    /// Does not free them. If the epoch cannot advance, the pool is unchanged.
+    pub fn fence_epoch(&mut self) -> Result<u64, CacheError> {
+        let next = self.epoch.checked_add(1).ok_or(CacheError::QuotaExceeded {
+            kind: QuotaKind::Registrations,
+        })?;
+        self.epoch = next;
         for region in &mut self.regions {
             if matches!(
                 region.state,
@@ -283,7 +323,7 @@ impl RegisteredPool {
                 region.state = RegionState::Quarantined { fenced: true };
             }
         }
-        self.epoch
+        Ok(self.epoch)
     }
 
     /// Free slots that fencing already marked. Unfenced quarantine stays.
@@ -299,15 +339,14 @@ impl RegisteredPool {
         Ok(freed)
     }
 
-    fn alloc_id(&mut self) -> Result<SlotId, CacheError> {
-        if self.next_id == u64::MAX {
-            return Err(CacheError::QuotaExceeded {
-                kind: QuotaKind::Registrations,
-            });
-        }
-        let id = SlotId(self.next_id);
-        self.next_id += 1;
-        Ok(id)
+    #[cfg(test)]
+    fn set_next_id_for_test(&mut self, next_id: u64) {
+        self.next_id = next_id;
+    }
+
+    #[cfg(test)]
+    fn set_epoch_for_test(&mut self, epoch: u64) {
+        self.epoch = epoch;
     }
 
     fn ensure_batch(&self, batch: &CheckedBatch) -> Result<(), CacheError> {
@@ -403,7 +442,7 @@ mod tests {
         let id = batch.slots()[0];
         pool.on_lease_expiry(id).unwrap();
         assert_eq!(pool.reclaim_fenced().unwrap(), 0);
-        pool.fence_epoch();
+        pool.fence_epoch().unwrap();
         assert_eq!(pool.stats().quarantined, 1);
         assert_eq!(pool.reclaim_fenced().unwrap(), 1);
         assert_eq!(pool.stats().idle_unbound, 2);
@@ -417,5 +456,63 @@ mod tests {
         let stats = pool.stats();
         assert_eq!(stats.idle_unbound, 2);
         assert_eq!(stats.registration_ops, 0);
+    }
+
+    #[test]
+    fn checkout_prefers_an_idle_registration_over_a_lower_unbound_slot() {
+        let mut pool = RegisteredPool::new(2, 8).unwrap();
+        let first = pool.checkout_batch(1).unwrap();
+        let second = pool.checkout_batch(1).unwrap();
+        let idle_id = second.slots()[0];
+        pool.complete_batch(&first, SimCompletion::Unknown).unwrap();
+        pool.attest_drain(first.slots()[0]).unwrap();
+        pool.complete_batch(&second, SimCompletion::Completed)
+            .unwrap();
+        assert_eq!(pool.stats().idle_unbound, 1);
+        assert_eq!(pool.stats().idle_registered, 1);
+        let reused = pool.checkout_batch(1).unwrap();
+        assert_eq!(reused.slots()[0], idle_id);
+        let stats = pool.stats();
+        assert_eq!(stats.registration_ops, 2);
+        assert_eq!(stats.reused_registrations, 1);
+        assert_eq!(stats.idle_unbound, 1);
+    }
+
+    #[test]
+    fn id_exhaustion_does_not_check_out_a_prefix_of_the_batch() {
+        let mut pool = RegisteredPool::new(2, 4).unwrap();
+        pool.set_next_id_for_test(u64::MAX - 1);
+        let err = pool.checkout_batch(2).unwrap_err();
+        assert_eq!(
+            err,
+            CacheError::QuotaExceeded {
+                kind: QuotaKind::Registrations,
+            }
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.idle_unbound, 2);
+        assert_eq!(stats.checked_out, 0);
+        assert_eq!(stats.registration_ops, 0);
+        assert_eq!(stats.epoch, 1);
+    }
+
+    #[test]
+    fn fence_at_epoch_max_leaves_checked_out_slots_in_place() {
+        let mut pool = RegisteredPool::new(1, 4).unwrap();
+        let batch = pool.checkout_batch(1).unwrap();
+        pool.set_epoch_for_test(u64::MAX);
+        let err = pool.fence_epoch().unwrap_err();
+        assert_eq!(
+            err,
+            CacheError::QuotaExceeded {
+                kind: QuotaKind::Registrations,
+            }
+        );
+        assert_eq!(pool.stats().epoch, u64::MAX);
+        assert_eq!(pool.stats().checked_out, 1);
+        assert_eq!(pool.stats().quarantined, 0);
+        pool.complete_batch(&batch, SimCompletion::Completed)
+            .unwrap();
+        assert_eq!(pool.stats().idle_registered, 1);
     }
 }

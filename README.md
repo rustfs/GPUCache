@@ -20,9 +20,9 @@ V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated regist
 | V1 B: RustFS live Put/Head/RangeGet/Delete | `NOT_RUN_HARDWARE` (no authorized endpoint). Contract mock passes |
 | V1 C: fuzz, fault injection, synthetic token checks, paired-baseline stubs | Implemented in this tree. Real engine output is `NOT_RUN_HARDWARE` |
 | V2: `KvTransport`, TCP default, feature `rdma-nixl` | In progress. The feature compiles and `NixlTransport::open` refuses. Live RDMA is `NOT_RUN_HARDWARE` |
-| V2: bounded registered buffer pool (simulated pin, reuse, quarantine, backpressure) | Implemented in this tree. Not a NIC registration |
-| V2: shard-local directory, epoch fencing, single-flight, capacity credits | Implemented in-process. One process is one shard. No cross-shard quorum |
-| V2: G4 pack/manifest, async sink, cost-bounded refill | Implemented against the mock. Live RustFS is `NOT_RUN_HARDWARE` |
+| V2: bounded registered buffer pool (simulated pin, reuse, quarantine, backpressure) | Implemented in this tree. Checkout prefers an already-bound slot and does not partially check out a batch. Not a NIC registration |
+| V2: shard-local directory, epoch fencing, single-flight, capacity credits | Implemented in-process. One process is one shard. Finish, failure, and fence leave a notice with no payload. An epoch that cannot advance does not drop the fill. No cross-shard quorum |
+| V2: G4 pack/manifest, async sink, cost-bounded refill | Implemented against the mock. A failed drain keeps the job. A wrong-tenant refill does not return bytes. Live RustFS is `NOT_RUN_HARDWARE` |
 | V2: P/D, G3.5, and G4 hop list | Documented in [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md). Not a zero-copy claim |
 | V2: paired TTFT/TPOT against native NIXL | `NOT_RUN_HARDWARE` |
 | V3: `dpu-bf3` feature slot, simulated DRAM slab + storage queue, SPDK affinity check | In progress. Devices are not linked. `open_doca` / `open_nvme_device` / `open_spdk` refuse. `dpu-demo` prints `NOT_RUN_HARDWARE` |
@@ -33,6 +33,7 @@ V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated regist
 | V3: G4 retention, manifest version, reclaim, delete verification, tenant cold keys, backfill budget | Implemented against the mock. Live RustFS is `NOT_RUN_HARDWARE` |
 | V3: paired NIC-RDMA baseline vs DPU | `NOT_RUN_HARDWARE`. `tco=TCO_UNKNOWN`. `go_gate=NOT_EVALUATED`. TCP is not the DPU baseline |
 | V3: second engine (SGLang / HiCache) | Not added. Evaluation note only. See [docs/adr/0008-second-engine.md](docs/adr/0008-second-engine.md) |
+| Mooncake-informed CPU contracts | Implemented in this tree. See [docs/MOONCAKE.md](docs/MOONCAKE.md) and [docs/adr/0009-mooncake-lessons.md](docs/adr/0009-mooncake-lessons.md). Mooncake is not linked. No NIC, Soft-RoCE, or DPU number is claimed |
 | Erasure coding and durability replicas | Will not be built. A lost or failed hot block is a clean miss, then recompute and repopulate. Cold durability is RustFS G4 |
 
 The integration route (native vLLM KV connector or LMCache) is **not chosen**. See [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md). Hot-tier failure policy is [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md). The V3 offload candidate is [docs/adr/0006-storage-queue-offload.md](docs/adr/0006-storage-queue-offload.md). It is a hypothesis pending a paired measurement, not a measured bottleneck.
@@ -151,7 +152,7 @@ docs/adr             decision records
 COMPATIBILITY.md     environment manifest
 ```
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/CORRECTNESS.md](docs/CORRECTNESS.md), [docs/RISKS.md](docs/RISKS.md), [docs/V1C_TEST_MATRIX.md](docs/V1C_TEST_MATRIX.md), [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md), [docs/V2_TEST_MATRIX.md](docs/V2_TEST_MATRIX.md), [docs/V3_DPU_TARGETS.md](docs/V3_DPU_TARGETS.md), [docs/V3_TEST_MATRIX.md](docs/V3_TEST_MATRIX.md), [docs/V3_FAILURES.md](docs/V3_FAILURES.md).
+Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROTOCOL.md](docs/PROTOCOL.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), [docs/BENCHMARKS.md](docs/BENCHMARKS.md), [docs/CORRECTNESS.md](docs/CORRECTNESS.md), [docs/RISKS.md](docs/RISKS.md), [docs/MOONCAKE.md](docs/MOONCAKE.md), [docs/V1C_TEST_MATRIX.md](docs/V1C_TEST_MATRIX.md), [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md), [docs/V2_TEST_MATRIX.md](docs/V2_TEST_MATRIX.md), [docs/V3_DPU_TARGETS.md](docs/V3_DPU_TARGETS.md), [docs/V3_TEST_MATRIX.md](docs/V3_TEST_MATRIX.md), [docs/V3_FAILURES.md](docs/V3_FAILURES.md).
 
 ## License
 

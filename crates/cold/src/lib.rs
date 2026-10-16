@@ -21,11 +21,13 @@ pub use demo::{run_cold_demo, ColdReport};
 pub use http::{live_probe, ProbeReport, ProbeStatus};
 pub use mock::MockObjectStore;
 pub use ops::{
-    enqueue_backfill, refill_degraded, verify_deleted, BackfillLimit, ColdAvailability, ColdKeys,
-    ColdOps, ObjectRecord, ReclaimStep, Retention,
+    enqueue_backfill, refill_degraded, refill_for_tenant, verify_deleted, BackfillLimit,
+    ColdAvailability, ColdKeys, ColdOps, ObjectRecord, ReclaimStep, Retention,
 };
 pub use pack::{
     contract_smoke, manifest_version, pack_blocks, read_manifest, Manifest, ObjectMeta,
     ObjectStore, PackedBlock, PayloadRange, MANIFEST_VERSION,
 };
-pub use sink::{refill_generation, AsyncSink, ColdJob, RefillBudget, RefillOutcome};
+pub use sink::{
+    refill_generation, refill_matching, AsyncSink, ColdJob, RefillBudget, RefillOutcome,
+};

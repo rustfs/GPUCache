@@ -81,11 +81,11 @@ ABSENT -> RESERVED -> WRITING -> COMMITTED -> EVICTING -> ABSENT
 
 `KvTransport` is the byte-path trait. `TcpTransport::submit` copies into a bounded host buffer and reports `dma_posted=false`. `NixlTransport::open` fails closed. Feature `rdma-nixl` does not link libnixl. See [adr/0004-nixl-transport.md](adr/0004-nixl-transport.md) and [V2_DATA_PATHS.md](V2_DATA_PATHS.md).
 
-`RegisteredPool` is a fixed set of `Vec<u8>` slots. Checkout reuses a binding instead of allocating a new region id. Unknown completion quarantines the slot. Lease expiry does not free it. `fence_epoch` then `reclaim_fenced` does, and so does `attest_drain`. Retired ids are not recycled.
+`RegisteredPool` is a fixed set of `Vec<u8>` slots. Checkout prefers a slot that is already bound, then an unbound slot. A batch that cannot be fully satisfied does not change the pool. Unknown completion quarantines the slot. Lease expiry does not free it. `fence_epoch` then `reclaim_fenced` does, and so does `attest_drain`. If the epoch cannot advance, checked-out slots stay checked out. Retired ids are not recycled.
 
-`ShardDirectory` is local to one shard. Shard 0 is the single-node case and uses the same methods. A membership change bumps the epoch, drops in-flight fills, and releases credits. Single-flight joins do not charge twice and do not return payload bytes. There is no per-token central directory and no per-block quorum. See [adr/0005-shard-fencing.md](adr/0005-shard-fencing.md).
+`ShardDirectory` is local to one shard. Shard 0 is the single-node case and uses the same methods. A membership change bumps the epoch, drops in-flight fills, and releases credits. Single-flight joins do not charge twice and do not return payload bytes. `FillNotice` tells a leader and each joiner whether the fill is pending, finished, failed, or fenced. Finished is not a hit. Fenced is not success. There is no per-token central directory and no per-block quorum. See [adr/0005-shard-fencing.md](adr/0005-shard-fencing.md) and [MOONCAKE.md](MOONCAKE.md).
 
-The cold sink queues a pack and drains it with Put. Refill Heads the manifest first. Over budget returns `OverBudget` and no payload. That outcome is a recompute, not a hit.
+The cold sink queues a pack and drains it with Put. A failed put puts the job back at the front and does not publish a manifest for a deleted object. Refill Heads the manifest first. Over budget returns `OverBudget` and no payload. `refill_matching` returns `Unauthorized` when the manifest range names another tenant, and it does not download that payload. Those outcomes are recomputes, not hits. Manifest version 2 is the layout that carries the tenant.
 
 ## V3 offload and hardening
 

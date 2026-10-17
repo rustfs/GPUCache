@@ -26,11 +26,26 @@ pub struct TransferDesc<'a> {
     pub bytes: &'a [u8],
 }
 
+/// Why `submit_preferring_rdma` did not stay on the preferred path.
+///
+/// `RdmaNotLinked` is the CPU contract for this tree. It is not a NIC retry
+/// and it is not a measured fallback latency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// The receipt's `kind` is the path that was asked for.
+    None,
+    /// The RDMA slot refused to open. Bytes were staged on TCP instead.
+    RdmaNotLinked,
+}
+
 /// What `submit` actually did. `staged_bytes` is the length copied into the
 /// host staging buffer. It is not a wire-byte count and not a latency.
+/// `attempted` is the path the caller preferred. `kind` is the path that ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferReceipt {
     pub kind: TransportKind,
+    pub attempted: TransportKind,
+    pub fallback: FallbackReason,
     pub host_copies: u32,
     pub registration_reused: bool,
     pub dma_posted: bool,
@@ -100,6 +115,8 @@ impl KvTransport for TcpTransport {
         drop(staged);
         Ok(TransferReceipt {
             kind: TransportKind::Tcp,
+            attempted: TransportKind::Tcp,
+            fallback: FallbackReason::None,
             host_copies: 1,
             registration_reused: false,
             dma_posted: false,
@@ -107,6 +124,54 @@ impl KvTransport for TcpTransport {
             staged_bytes: desc.bytes.len() as u64,
         })
     }
+}
+
+/// Prefer the RDMA slot, then stage on TCP when that slot is not linked.
+///
+/// This build's `NixlTransport::open` always fails closed. The receipt then
+/// names TCP as the path that ran and `RdmaNotLinked` as the reason. `dma_posted`
+/// stays false. The function does not invent a NIC retry or a bandwidth number.
+pub fn submit_preferring_rdma(
+    tcp: &mut TcpTransport,
+    desc: &TransferDesc<'_>,
+) -> Result<TransferReceipt, CacheError> {
+    match NixlTransport::open() {
+        Ok(mut nixl) => match nixl.submit(desc) {
+            Ok(receipt) => {
+                if receipt.dma_posted || receipt.hardware != HardwarePath::NotRunHardware {
+                    return Err(CacheError::Storage {
+                        reason: "rdma not linked",
+                    });
+                }
+                Ok(TransferReceipt {
+                    attempted: TransportKind::RdmaNixl,
+                    fallback: FallbackReason::None,
+                    ..receipt
+                })
+            }
+            Err(CacheError::Storage {
+                reason: "rdma not linked",
+            }) => tcp_after_rdma_refusal(tcp, desc),
+            Err(err) => Err(err),
+        },
+        Err(CacheError::Storage {
+            reason: "rdma not linked",
+        }) => tcp_after_rdma_refusal(tcp, desc),
+        Err(err) => Err(err),
+    }
+}
+
+fn tcp_after_rdma_refusal(
+    tcp: &mut TcpTransport,
+    desc: &TransferDesc<'_>,
+) -> Result<TransferReceipt, CacheError> {
+    let mut receipt = tcp.submit(desc)?;
+    receipt.attempted = TransportKind::RdmaNixl;
+    receipt.kind = TransportKind::Tcp;
+    receipt.fallback = FallbackReason::RdmaNotLinked;
+    receipt.dma_posted = false;
+    receipt.hardware = HardwarePath::CpuContract;
+    Ok(receipt)
 }
 
 /// NIXL slot. Constructing this value does not open a device.
@@ -164,6 +229,8 @@ mod tests {
         let mut tcp = TcpTransport::new(64).unwrap();
         let receipt = tcp.submit(&TransferDesc { bytes: b"kv-bytes" }).unwrap();
         assert_eq!(receipt.kind, TransportKind::Tcp);
+        assert_eq!(receipt.attempted, TransportKind::Tcp);
+        assert_eq!(receipt.fallback, FallbackReason::None);
         assert_eq!(receipt.host_copies, 1);
         assert!(!receipt.dma_posted);
         assert!(!receipt.registration_reused);
@@ -204,5 +271,35 @@ mod tests {
                 reason: "rdma not linked"
             })
         ));
+    }
+
+    #[test]
+    fn rdma_refusal_falls_back_to_tcp_without_posting() {
+        let mut tcp = TcpTransport::new(32).unwrap();
+        let receipt =
+            submit_preferring_rdma(&mut tcp, &TransferDesc { bytes: b"kv-block" }).unwrap();
+        assert_eq!(receipt.attempted, TransportKind::RdmaNixl);
+        assert_eq!(receipt.kind, TransportKind::Tcp);
+        assert_eq!(receipt.fallback, FallbackReason::RdmaNotLinked);
+        assert!(!receipt.dma_posted);
+        assert_eq!(receipt.hardware, HardwarePath::CpuContract);
+        assert_eq!(receipt.host_copies, 1);
+        assert_eq!(receipt.staged_bytes, 8);
+        assert_eq!(tcp.submits(), 1);
+        assert_eq!(rdma_probe(), "NOT_RUN_HARDWARE");
+    }
+
+    #[test]
+    fn rdma_fallback_keeps_tcp_backpressure() {
+        let mut tcp = TcpTransport::new(2).unwrap();
+        let err = submit_preferring_rdma(&mut tcp, &TransferDesc { bytes: b"abcd" }).unwrap_err();
+        assert_eq!(
+            err,
+            CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightBytes,
+            }
+        );
+        assert_eq!(tcp.submits(), 0);
+        assert_eq!(tcp.staged_bytes(), 0);
     }
 }

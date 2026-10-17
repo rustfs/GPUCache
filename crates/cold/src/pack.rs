@@ -10,7 +10,9 @@ const OBJECT_MAGIC: &[u8; 4] = b"GPKG";
 const MANIFEST_MAGIC: &[u8; 4] = b"GPMF";
 const OBJECT_VERSION: u16 = 1;
 /// Manifest layout this crate will read. Any other version is a miss.
-pub const MANIFEST_VERSION: u16 = 1;
+/// Version 3 binds every range to its complete canonical cache identity.
+/// Versions 1 and 2 are clean refill misses and must be recomputed.
+pub const MANIFEST_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -32,6 +34,11 @@ pub struct PayloadRange {
     pub offset: u64,
     pub length: u64,
     pub checksum: Checksum,
+    /// Tenant that owns this generation. A refill for a different tenant must
+    /// not return the payload.
+    pub tenant: Vec<u8>,
+    /// SHA-256 of the validated complete canonical CacheIdentity.
+    pub identity_digest: Checksum,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,8 +73,27 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
     if !key_ok(namespace) {
         return Err(CacheError::Malformed { reason: "cold key" });
     }
+    // Validate the final, longer key before building a potentially large pack.
+    let _ = content_key(namespace, "manifest", Checksum([0; 32]))?;
     let mut records = Vec::with_capacity(blocks.len());
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
+        if blocks[..index]
+            .iter()
+            .any(|earlier| earlier.generation == block.generation)
+        {
+            return Err(CacheError::Malformed {
+                reason: "cold pack",
+            });
+        }
+        let tenant = block.identity.tenant.as_bytes();
+        if tenant.is_empty() || tenant.len() > 128 {
+            return Err(CacheError::Malformed { reason: "cold key" });
+        }
+        if block.payload.is_empty() {
+            return Err(CacheError::Malformed {
+                reason: "cold pack",
+            });
+        }
         verify_checksum(&block.payload, block.checksum)?;
         if block.payload.len() > HARD_BYTES_CAP {
             return Err(CacheError::ObjectTooLarge {
@@ -75,14 +101,15 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
                 actual: block.payload.len() as u64,
             });
         }
-        records.push((block, block.identity.to_bytes()?));
+        let digest = identity_digest(&block.identity)?;
+        records.push((block, block.identity.to_bytes()?, tenant.to_vec(), digest));
     }
     let mut object = ByteWriter::with_capacity(64);
     object.raw(OBJECT_MAGIC);
     object.u16(OBJECT_VERSION);
     object.u32(u32::try_from(records.len()).unwrap_or(u32::MAX));
     let mut ranges = Vec::with_capacity(records.len());
-    for (block, identity) in &records {
+    for (block, identity, tenant, digest) in &records {
         object.u64(block.generation);
         object.raw(&block.checksum.0);
         object.bytes(identity)?;
@@ -93,12 +120,13 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
             offset: offset as u64,
             length: block.payload.len() as u64,
             checksum: block.checksum,
+            tenant: tenant.clone(),
+            identity_digest: *digest,
         });
     }
     let object_bytes = object.finish();
     let object_checksum = content_checksum(&object_bytes);
-    let object_key = format!("{namespace}/object");
-    let manifest_key = format!("{namespace}/manifest");
+    let object_key = content_key(namespace, "object", object_checksum)?;
     let mut manifest = ByteWriter::with_capacity(64);
     manifest.raw(MANIFEST_MAGIC);
     manifest.u16(MANIFEST_VERSION);
@@ -110,12 +138,16 @@ pub fn pack_blocks(namespace: &str, blocks: &[PackedBlock]) -> Result<Pack, Cach
         manifest.u64(range.offset);
         manifest.u64(range.length);
         manifest.raw(&range.checksum.0);
+        manifest.bytes(&range.tenant)?;
+        manifest.raw(&range.identity_digest.0);
     }
+    let manifest_bytes = manifest.finish();
+    let manifest_key = content_key(namespace, "manifest", content_checksum(&manifest_bytes))?;
     Ok(Pack {
         object_key,
         manifest_key,
         object_bytes,
-        manifest_bytes: manifest.finish(),
+        manifest_bytes,
         ranges,
     })
 }
@@ -216,12 +248,27 @@ pub fn read_manifest(bytes: &[u8]) -> Result<Manifest, CacheError> {
     }
     let mut ranges = Vec::with_capacity(n);
     for _ in 0..n {
-        ranges.push(PayloadRange {
+        let range = PayloadRange {
             generation: r.u64()?,
             offset: r.u64()?,
             length: r.u64()?,
             checksum: Checksum(r.array32()?),
-        });
+            tenant: r.bytes(128)?.to_vec(),
+            identity_digest: Checksum(r.array32()?),
+        };
+        if range.tenant.is_empty()
+            || range.length == 0
+            || range.length > HARD_BYTES_CAP as u64
+            || range.offset.checked_add(range.length).is_none()
+            || ranges
+                .iter()
+                .any(|earlier: &PayloadRange| earlier.generation == range.generation)
+        {
+            return Err(CacheError::Malformed {
+                reason: "cold manifest",
+            });
+        }
+        ranges.push(range);
     }
     r.finish()?;
     Ok(Manifest {
@@ -229,6 +276,112 @@ pub fn read_manifest(bytes: &[u8]) -> Result<Manifest, CacheError> {
         object_key,
         ranges,
     })
+}
+
+pub(crate) fn identity_digest(identity: &CacheIdentity) -> Result<Checksum, CacheError> {
+    identity.validate_wire()?;
+    Ok(content_checksum(&identity.to_bytes()?))
+}
+
+fn digest_hex(checksum: Checksum) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(64);
+    for byte in checksum.0 {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    value
+}
+
+fn content_key(namespace: &str, kind: &str, checksum: Checksum) -> Result<String, CacheError> {
+    let key = format!("{namespace}/{}/{kind}", digest_hex(checksum));
+    if !key_ok(namespace) || !key_ok(&key) {
+        return Err(CacheError::Malformed { reason: "cold key" });
+    }
+    Ok(key)
+}
+
+fn content_namespace<'a>(
+    key: &'a str,
+    kind: &str,
+    checksum: Checksum,
+) -> Result<&'a str, CacheError> {
+    let suffix = format!("/{kind}");
+    let Some(prefix) = key.strip_suffix(&suffix) else {
+        return Err(CacheError::Malformed { reason: "cold key" });
+    };
+    let Some((namespace, digest)) = prefix.rsplit_once('/') else {
+        return Err(CacheError::Malformed { reason: "cold key" });
+    };
+    if !key_ok(key) || !key_ok(namespace) {
+        return Err(CacheError::Malformed { reason: "cold key" });
+    }
+    if digest != digest_hex(checksum) {
+        return Err(CacheError::ChecksumMismatch);
+    }
+    Ok(namespace)
+}
+
+/// Validate the content-addressed manifest and its reference to the object.
+pub(crate) fn validate_manifest_binding(
+    manifest_key: &str,
+    manifest_bytes: &[u8],
+    manifest: &Manifest,
+) -> Result<(), CacheError> {
+    let manifest_namespace =
+        content_namespace(manifest_key, "manifest", content_checksum(manifest_bytes))?;
+    let object_namespace =
+        content_namespace(&manifest.object_key, "object", manifest.object_checksum)?;
+    if manifest_namespace != object_namespace {
+        return Err(CacheError::Malformed { reason: "cold key" });
+    }
+    Ok(())
+}
+
+/// Reject a manually assembled job that could overwrite another published pack
+/// or claim a range/identity absent from its object. No storage calls are made.
+pub(crate) fn validate_pack_job(
+    object_key: &str,
+    object_bytes: &[u8],
+    manifest_key: &str,
+    manifest_bytes: &[u8],
+) -> Result<(), CacheError> {
+    let manifest = read_manifest(manifest_bytes)?;
+    validate_manifest_binding(manifest_key, manifest_bytes, &manifest)?;
+    if manifest.object_key != object_key
+        || content_checksum(object_bytes) != manifest.object_checksum
+    {
+        return Err(CacheError::ChecksumMismatch);
+    }
+    let mut object = ByteReader::new(object_bytes);
+    if object.raw(4)? != OBJECT_MAGIC
+        || object.u16()? != OBJECT_VERSION
+        || object.u32()? as usize != manifest.ranges.len()
+    {
+        return Err(CacheError::Malformed {
+            reason: "cold pack",
+        });
+    }
+    for range in &manifest.ranges {
+        let generation = object.u64()?;
+        let checksum = Checksum(object.array32()?);
+        let identity = CacheIdentity::from_bytes(object.bytes(HARD_BYTES_CAP)?)?;
+        let offset = object_bytes.len() - object.remaining() + 4;
+        let payload = object.bytes(HARD_BYTES_CAP)?;
+        if generation != range.generation
+            || checksum != range.checksum
+            || range.offset != offset as u64
+            || range.length != payload.len() as u64
+            || range.tenant != identity.tenant.as_bytes()
+            || range.identity_digest != identity_digest(&identity)?
+        {
+            return Err(CacheError::Malformed {
+                reason: "cold pack",
+            });
+        }
+        verify_checksum(payload, checksum)?;
+    }
+    object.finish()
 }
 
 pub(crate) fn key_ok(key: &str) -> bool {
@@ -262,14 +415,99 @@ mod tests {
             MANIFEST_VERSION
         );
         let mut bad = pack.manifest_bytes.clone();
-        bad[4] = 2;
+        bad[4] = 9;
         bad[5] = 0;
-        assert_eq!(manifest_version(&bad).unwrap(), 2);
+        assert_eq!(manifest_version(&bad).unwrap(), 9);
         assert!(matches!(
             read_manifest(&bad),
             Err(CacheError::Storage {
                 reason: "store corrupt"
             })
         ));
+    }
+
+    #[test]
+    fn duplicate_generation_is_rejected() {
+        let mut blocks = sample_blocks().unwrap();
+        blocks[1].generation = blocks[0].generation;
+        assert_eq!(
+            pack_blocks("dup", &blocks).unwrap_err(),
+            CacheError::Malformed {
+                reason: "cold pack"
+            }
+        );
+    }
+
+    #[test]
+    fn content_derived_keys_validate_the_final_length() {
+        let blocks = sample_blocks().unwrap();
+        let pack = pack_blocks(&"n".repeat(182), &blocks).unwrap();
+        assert_eq!(pack.manifest_key.len(), 256);
+        assert!(pack.object_key.len() <= 256);
+        validate_pack_job(
+            &pack.object_key,
+            &pack.object_bytes,
+            &pack.manifest_key,
+            &pack.manifest_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            pack_blocks(&"n".repeat(183), &blocks).unwrap_err(),
+            CacheError::Malformed { reason: "cold key" }
+        );
+    }
+
+    #[test]
+    fn publication_rejects_forged_identity_even_with_content_derived_keys() {
+        let blocks = sample_blocks().unwrap();
+        let pack = pack_blocks("forged", &blocks).unwrap();
+        let mut manifest_bytes = pack.manifest_bytes.clone();
+        // The final field is the last range's complete identity digest.
+        *manifest_bytes.last_mut().unwrap() ^= 1;
+        let manifest_key =
+            content_key("forged", "manifest", content_checksum(&manifest_bytes)).unwrap();
+        assert_eq!(
+            validate_pack_job(
+                &pack.object_key,
+                &pack.object_bytes,
+                &manifest_key,
+                &manifest_bytes,
+            )
+            .unwrap_err(),
+            CacheError::Malformed {
+                reason: "cold pack"
+            }
+        );
+    }
+
+    #[test]
+    fn publication_rejects_cross_namespace_and_body_substitution() {
+        let blocks = sample_blocks().unwrap();
+        let pack = pack_blocks("bound", &blocks).unwrap();
+        let foreign_manifest = content_key(
+            "foreign",
+            "manifest",
+            content_checksum(&pack.manifest_bytes),
+        )
+        .unwrap();
+        assert!(validate_pack_job(
+            &pack.object_key,
+            &pack.object_bytes,
+            &foreign_manifest,
+            &pack.manifest_bytes,
+        )
+        .is_err());
+        let mut wrong_body = pack.object_bytes.clone();
+        *wrong_body.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            validate_pack_job(
+                &pack.object_key,
+                &wrong_body,
+                &pack.manifest_key,
+                &pack.manifest_bytes,
+            )
+            .unwrap_err(),
+            CacheError::ChecksumMismatch
+        );
     }
 }

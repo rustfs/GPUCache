@@ -12,7 +12,8 @@
 use std::collections::VecDeque;
 
 use gpucache_core_types::{
-    content_checksum, CacheError, Checksum, TenantId, TrustDomain, HARD_BYTES_CAP,
+    content_checksum, ByteWriter, CacheError, Checksum, QuotaKind, TenantId, TrustDomain,
+    HARD_BYTES_CAP,
 };
 
 use crate::auth::{fingerprints_equal, AuthContext};
@@ -86,6 +87,7 @@ impl Acl {
     }
 
     pub fn grant(&mut self, ctx: AuthContext, write: bool) -> Result<(), CacheError> {
+        ctx.validate()?;
         if let Some(entry) = self.entries.iter_mut().find(|entry| {
             entry.tenant == ctx.tenant
                 && entry.trust == ctx.trust_domain
@@ -109,6 +111,7 @@ impl Acl {
     }
 
     pub fn check(&self, ctx: &AuthContext, write: bool) -> Result<(), CacheError> {
+        ctx.validate()?;
         let mut allowed = false;
         for entry in &self.entries {
             let same = entry.tenant == ctx.tenant
@@ -129,7 +132,14 @@ impl Acl {
 pub struct ReplayGuard {
     skew_ms: u64,
     capacity: usize,
-    seen: VecDeque<([u8; 32], [u8; 16])>,
+    seen: VecDeque<ReplayEntry>,
+    last_now_ms: Option<u64>,
+}
+
+struct ReplayEntry {
+    scope: [u8; 32],
+    nonce: [u8; 16],
+    observed_ms: u64,
 }
 
 impl ReplayGuard {
@@ -141,13 +151,15 @@ impl ReplayGuard {
             skew_ms,
             capacity,
             seen: VecDeque::new(),
+            last_now_ms: None,
         })
     }
 
     /// Accept `nonce` once inside the skew window.
     ///
-    /// The window is bounded. After `capacity` newer nonces, the oldest nonce
-    /// can be presented again. That is a window, not a permanent replay cache.
+    /// Entries are retained for the whole window, even when the guard is full.
+    /// Capacity exhaustion rejects new admissions instead of enabling replay.
+    /// `now_ms` must come from the server clock, never an untrusted request.
     pub fn observe(
         &mut self,
         tenant: &[u8],
@@ -162,17 +174,47 @@ impl ReplayGuard {
             return Err(CacheError::Unauthorized);
         }
         let tenant_key = content_checksum(tenant).0;
+        self.observe_scope(tenant_key, nonce, now_ms, issued_ms)
+    }
+
+    fn observe_scope(
+        &mut self,
+        scope: [u8; 32],
+        nonce: &[u8; 16],
+        now_ms: u64,
+        issued_ms: u64,
+    ) -> Result<(), CacheError> {
+        if *nonce == [0; 16] {
+            return Err(CacheError::Malformed { reason: "replay" });
+        }
+        if self.last_now_ms.is_some_and(|last| now_ms < last)
+            || issued_ms > now_ms
+            || now_ms - issued_ms > self.skew_ms
+        {
+            return Err(CacheError::Unauthorized);
+        }
+        self.last_now_ms = Some(now_ms);
+        // Subtraction cannot overflow: the clock is nondecreasing and every
+        // retained observation came from an earlier accepted server time.
+        self.seen
+            .retain(|entry| now_ms - entry.observed_ms <= self.skew_ms);
         if self
             .seen
             .iter()
-            .any(|(seen_tenant, seen_nonce)| *seen_tenant == tenant_key && seen_nonce == nonce)
+            .any(|entry| entry.scope == scope && entry.nonce == *nonce)
         {
             return Err(CacheError::IdempotencyConflict);
         }
         if self.seen.len() == self.capacity {
-            self.seen.pop_front();
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::IdempotencyTable,
+            });
         }
-        self.seen.push_back((tenant_key, *nonce));
+        self.seen.push_back(ReplayEntry {
+            scope,
+            nonce: *nonce,
+            observed_ms: now_ms,
+        });
         Ok(())
     }
 }
@@ -198,6 +240,11 @@ pub fn seal(key_id: u64, generation: u64, payload: &[u8]) -> Result<IntegritySea
 }
 
 pub fn open_seal(seal: &IntegritySeal, payload: &[u8]) -> Result<(), CacheError> {
+    if payload.is_empty() || payload.len() > HARD_BYTES_CAP {
+        return Err(CacheError::Malformed {
+            reason: "integrity",
+        });
+    }
     let actual = tag(seal.key_id, seal.generation, payload);
     if actual != seal.checksum {
         return Err(CacheError::ChecksumMismatch);
@@ -234,6 +281,8 @@ pub struct SecretRing {
     log: SecurityLog,
 }
 
+const MAX_SECRET_GENERATIONS: usize = 1024;
+
 impl SecretRing {
     pub fn open(fingerprint: [u8; 32], audit_cap: usize) -> Result<Self, CacheError> {
         if fingerprint == [0u8; 32] {
@@ -244,7 +293,7 @@ impl SecretRing {
             next_id: 1,
             log: SecurityLog::new(audit_cap)?,
         };
-        let id = ring.push(fingerprint, GenState::Current);
+        let id = ring.push(fingerprint, GenState::Current)?;
         ring.log.push(AuditEvent::Rotate { generation: id });
         Ok(ring)
     }
@@ -256,16 +305,19 @@ impl SecretRing {
         if self
             .items
             .iter()
-            .any(|item| item.fingerprint == fingerprint && item.state != GenState::Retired)
+            .any(|item| fingerprints_equal(&item.fingerprint, &fingerprint))
         {
             return Err(CacheError::IdempotencyConflict);
         }
+        // Preflight before demoting the current credential: a rejected rotation
+        // must leave the previous write authority and audit history unchanged.
+        self.check_capacity()?;
         for item in &mut self.items {
             if item.state == GenState::Current {
                 item.state = GenState::Overlap;
             }
         }
-        let id = self.push(fingerprint, GenState::Current);
+        let id = self.push(fingerprint, GenState::Current)?;
         self.log.push(AuditEvent::Rotate { generation: id });
         Ok(id)
     }
@@ -311,15 +363,30 @@ impl SecretRing {
         Err(CacheError::Unauthorized)
     }
 
-    fn push(&mut self, fingerprint: [u8; 32], state: GenState) -> u64 {
+    fn check_capacity(&self) -> Result<(), CacheError> {
+        if self.items.len() >= MAX_SECRET_GENERATIONS {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::IdempotencyTable,
+            });
+        }
+        self.next_id
+            .checked_add(1)
+            .ok_or(CacheError::FencingRejected {
+                reason: "secret generation exhausted",
+            })?;
+        Ok(())
+    }
+
+    fn push(&mut self, fingerprint: [u8; 32], state: GenState) -> Result<u64, CacheError> {
+        self.check_capacity()?;
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        self.next_id += 1;
         self.items.push(Gen {
             id,
             fingerprint,
             state,
         });
-        id
+        Ok(id)
     }
 }
 
@@ -342,8 +409,15 @@ pub fn authorize_request(
         log.push(AuditEvent::Deny);
         return Err(err);
     }
-    if let Err(err) = replay.observe(
-        ctx.tenant.as_bytes(),
+    // Scope replay by the complete authenticated principal, with unambiguous
+    // lengths. The same tenant label in another trust domain is independent.
+    let mut scope = ByteWriter::new();
+    scope.raw(b"gpucache-replay-v1");
+    scope.bytes(ctx.tenant.as_bytes())?;
+    scope.bytes(ctx.trust_domain.as_bytes())?;
+    scope.raw(&ctx.credential_fingerprint);
+    if let Err(err) = replay.observe_scope(
+        content_checksum(&scope.finish()).0,
         &stamp.nonce,
         stamp.now_ms,
         stamp.issued_ms,
@@ -474,5 +548,148 @@ mod tests {
         authorize_request(&acl, &mut replay, &mut log, &ctx(b"tenant-a", 8), denied).unwrap_err();
         let events: Vec<_> = log.events().copied().collect();
         assert_eq!(events, vec![AuditEvent::Replay, AuditEvent::Deny]);
+    }
+
+    #[test]
+    fn full_replay_window_never_evicts_a_live_nonce() {
+        let mut guard = ReplayGuard::new(100, 1).unwrap();
+        guard.observe(b"tenant-a", &[1; 16], 10, 10).unwrap();
+        assert_eq!(
+            guard.observe(b"tenant-a", &[2; 16], 11, 11),
+            Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::IdempotencyTable,
+            })
+        );
+        assert_eq!(
+            guard.observe(b"tenant-a", &[1; 16], 110, 10),
+            Err(CacheError::IdempotencyConflict)
+        );
+        guard.observe(b"tenant-a", &[2; 16], 111, 111).unwrap();
+        assert_eq!(guard.seen.len(), 1);
+        assert_eq!(
+            guard.observe(b"tenant-a", &[1; 16], 111, 10),
+            Err(CacheError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn replay_window_rejects_clock_rollback_without_losing_entries() {
+        let mut guard = ReplayGuard::new(10, 2).unwrap();
+        guard.observe(b"tenant-a", &[1; 16], 100, 100).unwrap();
+        assert_eq!(
+            guard.observe(b"tenant-a", &[2; 16], 99, 99),
+            Err(CacheError::Unauthorized)
+        );
+        assert_eq!(
+            guard.observe(b"tenant-a", &[1; 16], 100, 100),
+            Err(CacheError::IdempotencyConflict)
+        );
+    }
+
+    #[test]
+    fn replay_window_does_not_overflow_near_the_clock_limit() {
+        let mut guard = ReplayGuard::new(10, 1).unwrap();
+        guard
+            .observe(b"tenant-a", &[1; 16], u64::MAX - 1, u64::MAX - 1)
+            .unwrap();
+        assert_eq!(
+            guard.observe(b"tenant-a", &[1; 16], u64::MAX, u64::MAX - 1),
+            Err(CacheError::IdempotencyConflict)
+        );
+    }
+
+    #[test]
+    fn authenticated_replay_scopes_include_trust_and_credential() {
+        let a = ctx(b"tenant-a", 1);
+        let mut b = a.clone();
+        b.trust_domain = TrustDomain::new(b"other-trust".to_vec()).unwrap();
+        let c = ctx(b"tenant-a", 2);
+        let mut acl = Acl::new(3).unwrap();
+        for principal in [&a, &b, &c] {
+            acl.grant(principal.clone(), true).unwrap();
+        }
+        let mut replay = ReplayGuard::new(20, 3).unwrap();
+        let mut log = SecurityLog::new(8).unwrap();
+        let stamp = RequestStamp {
+            write: true,
+            nonce: [1; 16],
+            now_ms: 10,
+            issued_ms: 10,
+        };
+        for principal in [&a, &b, &c] {
+            authorize_request(&acl, &mut replay, &mut log, principal, stamp).unwrap();
+        }
+        assert_eq!(
+            authorize_request(&acl, &mut replay, &mut log, &a, stamp),
+            Err(CacheError::IdempotencyConflict)
+        );
+    }
+
+    #[test]
+    fn zero_credentials_cannot_be_granted_via_public_fields() {
+        let mut zero = ctx(b"tenant-a", 1);
+        zero.credential_fingerprint = [0; 32];
+        let mut acl = Acl::new(1).unwrap();
+        assert_eq!(acl.grant(zero.clone(), true), Err(CacheError::Unauthorized));
+        assert_eq!(acl.check(&zero, false), Err(CacheError::Unauthorized));
+    }
+
+    #[test]
+    fn failed_rotation_preserves_current_write_authority() {
+        let mut ring = SecretRing::open([1; 32], 8).unwrap();
+        ring.next_id = u64::MAX;
+        let before_log = ring.log.len();
+        assert_eq!(
+            ring.rotate([2; 32]),
+            Err(CacheError::FencingRejected {
+                reason: "secret generation exhausted",
+            })
+        );
+        assert_eq!(ring.allow_write(&[1; 32]), Ok(1));
+        assert_eq!(ring.allow_read(&[2; 32]), Err(CacheError::Unauthorized));
+        assert_eq!(ring.log.len(), before_log);
+    }
+
+    #[test]
+    fn retired_credentials_cannot_be_resurrected_by_rotation() {
+        let mut ring = SecretRing::open([1; 32], 8).unwrap();
+        ring.rotate([2; 32]).unwrap();
+        ring.retire(1).unwrap();
+        assert_eq!(ring.rotate([1; 32]), Err(CacheError::IdempotencyConflict));
+        assert_eq!(ring.allow_read(&[1; 32]), Err(CacheError::Unauthorized));
+        assert_eq!(ring.allow_write(&[2; 32]), Ok(2));
+    }
+
+    #[test]
+    fn secret_history_is_bounded_and_full_rotation_is_atomic() {
+        let mut ring = SecretRing::open([1; 32], 8).unwrap();
+        ring.items.resize_with(MAX_SECRET_GENERATIONS, || Gen {
+            id: 0,
+            fingerprint: [3; 32],
+            state: GenState::Retired,
+        });
+        assert_eq!(
+            ring.rotate([2; 32]),
+            Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::IdempotencyTable,
+            })
+        );
+        assert_eq!(ring.allow_write(&[1; 32]), Ok(1));
+        assert_eq!(ring.items.len(), MAX_SECRET_GENERATIONS);
+    }
+
+    #[test]
+    fn seal_verification_rejects_empty_payloads_even_with_matching_tags() {
+        let forged = IntegritySeal {
+            key_id: 1,
+            generation: 1,
+            checksum: tag(1, 1, &[]),
+        };
+        assert_eq!(
+            open_seal(&forged, &[]),
+            Err(CacheError::Malformed {
+                reason: "integrity",
+            })
+        );
     }
 }

@@ -150,6 +150,7 @@ impl MemoryStore {
         limits.validate()?;
         let mut map = HashMap::with_capacity(policies.len());
         for policy in policies {
+            policy.validate()?;
             if map
                 .insert(policy.tenant.as_bytes().to_vec(), policy)
                 .is_some()
@@ -1405,6 +1406,7 @@ impl MemoryStore {
         auth: &AuthContext,
         identity: Option<&CacheIdentity>,
     ) -> Result<(), CacheError> {
+        auth.validate()?;
         let policy = self
             .policies
             .get(auth.tenant.as_bytes())

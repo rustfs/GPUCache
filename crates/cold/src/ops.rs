@@ -11,10 +11,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use gpucache_core_types::{CacheError, Checksum, QuotaKind};
+use gpucache_core_types::{CacheError, CacheIdentity, Checksum, QuotaKind};
 
 use crate::pack::{key_ok, ObjectStore, MANIFEST_VERSION};
-use crate::sink::{refill_generation, AsyncSink, ColdJob, RefillBudget, RefillOutcome};
+use crate::refill::{refill_generation, refill_matching, RefillBudget, RefillOutcome};
+use crate::sink::{AsyncSink, ColdJob};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retention {
@@ -43,32 +44,38 @@ pub enum ColdAvailability {
     Unavailable,
 }
 
+/// Refill only for the complete expected identity from an authenticated caller.
+/// The historical name does not provide a tenant-only or unauthenticated path.
 pub fn refill_for_tenant(
     store: &dyn ObjectStore,
     manifest_key: &str,
     generation: u64,
     budget: &RefillBudget,
     availability: ColdAvailability,
-    tenant: &[u8],
+    expected: &CacheIdentity,
 ) -> Result<RefillOutcome, CacheError> {
     match availability {
         ColdAvailability::Slow | ColdAvailability::Unavailable => Ok(RefillOutcome::Missing),
         ColdAvailability::Ready => {
-            crate::sink::refill_matching(store, manifest_key, generation, budget, tenant)
+            refill_matching(store, manifest_key, generation, budget, expected)
         }
     }
 }
 
+/// Availability wrapper around the same mandatory identity-matching refill.
 pub fn refill_degraded(
     store: &dyn ObjectStore,
     manifest_key: &str,
     generation: u64,
     budget: &RefillBudget,
     availability: ColdAvailability,
+    expected: &CacheIdentity,
 ) -> Result<RefillOutcome, CacheError> {
     match availability {
         ColdAvailability::Slow | ColdAvailability::Unavailable => Ok(RefillOutcome::Missing),
-        ColdAvailability::Ready => refill_generation(store, manifest_key, generation, budget),
+        ColdAvailability::Ready => {
+            refill_generation(store, manifest_key, generation, budget, expected)
+        }
     }
 }
 
@@ -487,7 +494,15 @@ mod tests {
         store.put("ns/manifest", b"not-a-manifest").unwrap();
         let budget = RefillBudget::new(1024, 1).unwrap();
         for availability in [ColdAvailability::Slow, ColdAvailability::Unavailable] {
-            let outcome = refill_degraded(&store, "ns/manifest", 1, &budget, availability).unwrap();
+            let outcome = refill_degraded(
+                &store,
+                "ns/manifest",
+                1,
+                &budget,
+                availability,
+                &synthetic_identity(1, 1),
+            )
+            .unwrap();
             assert_eq!(outcome, RefillOutcome::Missing);
         }
         assert!(store.head("ns/manifest").is_ok());
@@ -524,8 +539,15 @@ mod tests {
         let store = ClosedStore;
         for availability in [ColdAvailability::Slow, ColdAvailability::Unavailable] {
             assert_eq!(
-                refill_for_tenant(&store, "ns/manifest", 1, &budget, availability, b"tenant-a")
-                    .unwrap(),
+                refill_for_tenant(
+                    &store,
+                    "ns/manifest",
+                    1,
+                    &budget,
+                    availability,
+                    &synthetic_identity(1, 1),
+                )
+                .unwrap(),
                 RefillOutcome::Missing
             );
         }

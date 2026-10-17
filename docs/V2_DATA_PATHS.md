@@ -37,12 +37,20 @@ The hot TCP service does not depend on `gpucache-cold`. RustFS is not on the pre
 
 | Hop | What this tree does | Copy or registration |
 | --- | --- | --- |
-| Pack | `pack_blocks` writes one object and one manifest in host memory | Host copy into the pack buffers |
-| Async sink | `AsyncSink` queues that pair up to a job and byte cap. `drain` puts the object, then the manifest. A failed put requeues that job. A failed manifest put deletes the object. `cancel` drops the queue and writes nothing | Host buffers until drain. Not a runtime thread pool |
+| Pack | `pack_blocks` writes an object and a v3 manifest in host memory. Each range carries its tenant and a digest of its validated canonical `CacheIdentity`. Object and manifest keys contain their respective content digests | Host copy into the pack buffers |
+| Async sink | Admission validates the complete pack/key pairing. `drain_report` puts the object, then the manifest; temporary failures retry at the tail up to three attempts, and permanent/exhausted failures enter the failed queue. Pending and failed jobs share the job and byte caps. Ambiguous PUT errors preserve the object. `take_failed` releases an individual failed job; `cancel` clears both queues and closes the sink | Host buffers remain charged until completion, failed-job retrieval, or explicit cancellation. Not a runtime thread pool |
 | Mock store | In-process map. Contract test covers Put, Head, RangeGet, Delete | Not RustFS. Not a measurement |
 | Live HTTP | `live_probe` runs only when `GPUCACHE_RUSTFS_*` is set. Otherwise `NOT_RUN_HARDWARE` | Full HTTP body copy. Not GDS |
-| Refill | Head the manifest. If its length exceeds the budget, return `OverBudget` and do not download it. Otherwise download the manifest, and RangeGet one generation only when manifest bytes plus that range fit the total byte budget. `refill_matching` checks the tenant on that range first and does not download the payload on a mismatch. Checksum mismatch is an error, not a hit | Host copy of the manifest and, when allowed, one payload range |
+| Refill | Every public refill API requires the full expected `CacheIdentity`. Head the manifest and enforce the download budget. Versions 1 and 2 return `Missing` without fetching payload bytes. For v3, validate the manifest, tenant and canonical identity digest before requesting a payload range. Download only when manifest plus payload fit the total byte budget, then verify payload length and checksum | Host copy of the manifest and, when allowed, one payload range |
 | Promote into G3.5 | A later hot `Put` through the TCP API | A separate host copy. Not chained to the GET |
+
+`drain_report` visits at most the queue length captured at call start, bounded further by `max_jobs`; a requeued task cannot be attempted repeatedly in that call. The report preserves counts and the first job error. The compatible `drain` call returns that first error after the round, even if other jobs completed. Pending and failed jobs together cannot exceed the configured limits or the 4096-job hard ceiling. A full failed queue causes backpressure until the operator retrieves its jobs.
+
+Retries use the original content-addressed keys. A failed publication may leave an object without a manifest. Retain its keys for explicit later cleanup after ownership and reference checks. The sink implements neither a reference-safe orphan collector nor a crash-persistent orphan inventory, and does not infer safe deletion from a PUT failure or a HEAD result. It cannot provide a cross-object storage transaction.
+
+Callers migrate to `refill_generation(..., expected)` or `refill_matching(..., expected)` and pass that same identity through `refill_degraded` or `refill_for_tenant`. Old v1/v2 entries require recompute and repack; they are not converted by changing a header. The expected identity comes from the upstream authenticated and authorized request. The cold crate does not establish that identity, authorize arbitrary store keys, or verify the producer's model computation.
+
+`RefillBudget` accounts for manifest and payload bodies requested through the refill interface. It is not a backend wire-traffic or RSS bound: the current live HTTP probe also fetches an object body during HEAD to derive its checksum. Mock budget tests do not qualify that backend behavior.
 
 GDS and BlueField storage DMA are in development and were not run.
 

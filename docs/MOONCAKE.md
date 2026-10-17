@@ -31,9 +31,23 @@ These are CPU contracts. They do not post a work request.
 
 - **Pool.** Checkout uses an already-bound slot before it binds a free one. If the batch cannot be completed, including when region ids are exhausted, no slot changes state.
 - **Fallback.** `submit_preferring_rdma` records an RDMA attempt and a TCP result with reason `RdmaNotLinked`. `dma_posted` is false. `hardware` on that path is `CpuContract`.
-- **Fencing.** Leaders and joiners can read `Pending`, `LeaderFinished`, `LeaderFailed`, or `Fenced`. The notice has no bytes. `LeaderFinished` still requires a store `Get` or a recompute. A fenced fill is not success. If the epoch is already `u64::MAX`, the fence is refused and the in-flight fill stays.
-- **Cold path.** `drain` puts a failed job back. A manifest is not published for an object the failed drain deleted. Manifest version 2 stores the tenant on each range. `refill_matching` returns `Unauthorized` for a different tenant and does not download that payload. A slow or down cold tier is still `Missing` and does not touch the store.
+- **Fencing.** Leaders and joiners can read `Pending`, `LeaderFinished`, `LeaderFailed`, or `Fenced`. The notice has no bytes. `LeaderFinished` still requires a store `Get` or a recompute. A fenced fill is not success. A single fence refuses epoch overflow. `ControlPlane::isolate_domain` also checks the epoch budget for every victim before removing any member; an insufficient budget preserves the entire membership change and its current fills.
+- **Cold path.** Publication uses content-addressed object and manifest keys. The sink validates their pairing before admission, bounds retries, and isolates terminal failures without blocking unrelated work. An ambiguous PUT error never triggers deletion of an object that a visible manifest could reference. Manifest version 3 binds each range to the complete expected `CacheIdentity`; every public refill path requires that identity before it can return payload bytes. A slow or down cold tier is still `Missing` and does not touch the store.
 - **Bench labels.** `paired-baseline` prints `mooncake_transfer_engine=NOT_LINKED` and `mooncake_published_numbers=NOT_REPRODUCED`. `v3-paired` prints `mooncake_rdma=NOT_A_PERFORMANCE_RESULT`. Neither report contains a digit.
+
+## Cold failure contract and migration
+
+`AsyncSink::drain_report` attempts at most `min(max_jobs, queued_at_call_start)` jobs. A job is attempted once per call. Temporary storage, timeout, and quota errors move it to the queue tail until `MAX_WRITE_ATTEMPTS` (3) is reached. Permanent errors and exhausted retries enter the failed queue. `DrainReport` separates attempted, completed, requeued, and failed counts and retains the first job error. The compatible `drain` method processes that same round and then returns the first error, if any; an error does not undo jobs that completed in that round.
+
+Pending and failed jobs share the configured job and byte limits. `MAX_SINK_JOBS` (4096) is the metadata ceiling. `failed_count` and `take_failed` let an operator retrieve an individual failed job and release its retained credit. A full failed queue can still cause admission backpressure until its jobs are taken. `cancel` explicitly clears both queues and closes the sink. It is not a per-job recovery operation.
+
+Object keys are `namespace/<object-digest>/object`; manifest keys are `namespace/<manifest-digest>/manifest`. Each digest covers its own complete bytes. Retries retain those keys, so an older pack cannot overwrite a newer pack under the same namespace. A failed publication can leave an unreferenced object. `AsyncSink` does not implement reference-safe orphan reclamation. A later explicit cleanup must establish ownership and absence of live manifest references; a timeout, an unsuccessful PUT response, or one HEAD result is not permission to delete an object.
+
+Manifest v3 stores the tenant and the digest of the validated canonical `CacheIdentity` for each range. `refill_generation` and `refill_matching` now require `expected: &CacheIdentity`; the availability wrappers `refill_degraded` and `refill_for_tenant` require it as well. There is no public tenant-free refill path. Versions 1 and 2 yield `Missing` without downloading payload bytes. Existing cold entries must be recomputed and repacked with v3; merely changing the version field cannot migrate them.
+
+The expected identity must come from the caller's authenticated, authorized inference context. This crate does not authenticate a tenant, authorize arbitrary object-store keys, or prove that a producer computed the correct model state. Matching identity digests and payload checksums detects mismatched metadata and bytes within that upstream trust boundary. The same tenant name in another trust domain, model revision, adapter, prefix, or layout is not interchangeable.
+
+The required regression coverage is listed in [V2_TEST_MATRIX.md](V2_TEST_MATRIX.md). A Grok bot or VM operator should use the existing [VM runner](VM_REGRESSION.md#pr-8-cold-and-fencing-regressions), retain its exit code and artifacts, and preserve all `NOT_RUN_HARDWARE` labels.
 
 ## What stays out
 

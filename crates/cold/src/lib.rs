@@ -14,6 +14,7 @@ mod http;
 mod mock;
 mod ops;
 mod pack;
+mod refill;
 mod sigv4;
 mod sink;
 
@@ -26,8 +27,7 @@ pub use ops::{
 };
 pub use pack::{
     contract_smoke, manifest_version, pack_blocks, read_manifest, Manifest, ObjectMeta,
-    ObjectStore, PackedBlock, PayloadRange, MANIFEST_VERSION,
+    ObjectStore, Pack, PackedBlock, PayloadRange, MANIFEST_VERSION,
 };
-pub use sink::{
-    refill_generation, refill_matching, AsyncSink, ColdJob, RefillBudget, RefillOutcome,
-};
+pub use refill::{refill_generation, refill_matching, RefillBudget, RefillOutcome};
+pub use sink::{AsyncSink, ColdJob, DrainReport, FailedColdJob, MAX_SINK_JOBS, MAX_WRITE_ATTEMPTS};

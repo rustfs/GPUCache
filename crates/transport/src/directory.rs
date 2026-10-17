@@ -424,7 +424,7 @@ impl ShardDirectory {
     }
 
     #[cfg(test)]
-    fn set_epoch_for_test(&mut self, epoch: u64) {
+    pub(crate) fn set_epoch_for_test(&mut self, epoch: u64) {
         self.epoch = epoch;
     }
 

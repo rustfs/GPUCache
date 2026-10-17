@@ -48,6 +48,34 @@ cargo test -p gpucache-transport --all-targets --features rdma-nixl
 cargo test -p gpucache-dpu --all-targets --features dpu-bf3
 ```
 
+## PR 8 cold and fencing regressions
+
+A Grok bot or VM operator should run the existing CPU profile against the exact updated commit. Do not use an earlier green PR check as evidence for the updated implementation. From the repository root, choose a new or empty output directory:
+
+```sh
+python3 scripts/ci/vm_regression.py --profile cpu --output artifacts/pr8-cpu-01
+```
+
+Use `--offline` only when the locked dependencies are already cached. Keep the exit code and the entire output directory. Do not contact a bot or publish its report as part of this command. The runner's workspace test gate already discovers the new cold and transport tests, so there is no separate PR-specific profile or runner.
+
+For focused diagnosis before rerunning the complete profile:
+
+```sh
+cargo test --locked -p gpucache-cold --all-targets
+cargo test --locked -p gpucache-transport --all-targets
+```
+
+The acceptance checklist is [V2_TEST_MATRIX.md](V2_TEST_MATRIX.md#cold-publication-and-batch-fencing-regressions). Confirm all of the following in the retained test logs:
+
+- A permanent or exhausted sink job is isolated and individually retrievable. Temporary retries are bounded, do not prevent unrelated jobs from completing, and do not amplify one task repeatedly within a drain call.
+- Pending and failed jobs share the job/byte limits. Retrieving a failed job or cancelling releases the expected credit. Partial success and the first error are reported accurately.
+- A PUT that commits before returning an error does not trigger speculative deletion. Content-addressed object/manifest keys keep an old retry from replacing a newer pack.
+- Every refill API requires the full expected `CacheIdentity`. Cross-tenant, cross-trust-domain, cross-model, prefix and layout mismatches return no payload. The cold crate still relies on upstream authentication and authorization.
+- Legacy manifest versions 1 and 2 yield `Missing` without payload reads; malformed v3 data and checksum failures cannot become hits. Recompute and repack old entries instead of relabeling their version.
+- Multi-member domain isolation preflights its complete epoch budget. Insufficient budget leaves membership, credits and active fill notices unchanged.
+
+Retained cold objects after a failed publication are not evidence that garbage collection completed. Explicit orphan reclamation needs separate ownership/reference checks and is not qualified by this CPU gate. A green result does not add native NIXL, GDS, BlueField, RustFS hardware, or 10,000-GPU evidence.
+
 ## Artifact contract
 
 | Path | Contents | Interpretation |

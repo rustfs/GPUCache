@@ -56,7 +56,9 @@ The batch API is Lookup, Reserve/Put, Commit, Get, Release/Cancel, and Invalidat
 
 Lookup can return `PrefixHit` when a committed block's hash chain is a strict prefix of the query and the layout, dtype, shard, and model identity match. The hit is the whole stored block. `Get` must use `identity_for_prefix_hit`. A shorter `valid_length` on the same chain is an incompatible miss. The service does not slice inside a block.
 
-`gpucache-cold` packs blocks into an object plus a manifest and can Put, Head, RangeGet, and Delete through a trait. The TCP hot path does not call it. Without `GPUCACHE_RUSTFS_*` variables the live probe is `NOT_RUN_HARDWARE`. The mock still runs. V2 adds a bounded async sink and a refill that returns no bytes when the combined manifest and payload downloads exceed its byte budget.
+`gpucache-cold` packs blocks into an object plus a manifest and can Put, Head, RangeGet, and Delete through a trait. The TCP hot path does not call it. Without `GPUCACHE_RUSTFS_*` variables the live probe is `NOT_RUN_HARDWARE`. The mock still runs. Its bounded sink isolates permanent failures, caps transient retries, and allows healthy jobs to advance. Pending and failed jobs share admission limits; `take_failed` releases one failed job without cancelling other work. Content-derived object and manifest keys prevent interleaved retries from overwriting another pack. A PUT error does not trigger object deletion because publication may have succeeded before an acknowledgement was lost.
+
+Every public cold refill requires the full expected `CacheIdentity` from the upstream authenticated request. Manifest v3 binds each range to that identity, and mismatches return no payload. Legacy v1/v2 entries are clean misses and must be recomputed and repacked. The combined manifest and payload downloads must fit the refill byte budget. This identity check does not authenticate a caller or validate the producer's model computation. See [docs/V2_DATA_PATHS.md](docs/V2_DATA_PATHS.md) for the API migration and publication contract.
 
 Lifecycle:
 

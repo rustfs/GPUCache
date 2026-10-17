@@ -8,13 +8,12 @@
 
 use core::fmt;
 
-use gpucache_core_types::{content_checksum, synthetic_identity, CacheError};
+use gpucache_core_types::{content_checksum, synthetic_identity, CacheError, TenantId};
 
 use crate::http::{live_probe, ProbeStatus};
 use crate::pack::{contract_smoke, pack_blocks, PackedBlock};
-use crate::sink::{
-    refill_generation, refill_matching, AsyncSink, ColdJob, RefillBudget, RefillOutcome,
-};
+use crate::refill::{refill_generation, refill_matching, RefillBudget, RefillOutcome};
+use crate::sink::{AsyncSink, ColdJob};
 use crate::MockObjectStore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,24 +48,28 @@ pub fn run_cold_demo() -> Result<ColdReport, CacheError> {
         });
     }
     let budget = RefillBudget::new(1024 * 1024, 16)?;
-    match refill_generation(&store, &pack.manifest_key, 2, &budget)? {
+    let expected = &blocks[1].identity;
+    match refill_generation(&store, &pack.manifest_key, 2, &budget, expected)? {
         RefillOutcome::Loaded { payload } if payload == blocks[1].payload => {}
         _ => {
             return Err(CacheError::ChecksumMismatch);
         }
     }
     let tight = RefillBudget::new(1, 16)?;
-    if refill_generation(&store, &pack.manifest_key, 2, &tight)? != RefillOutcome::OverBudget {
+    if refill_generation(&store, &pack.manifest_key, 2, &tight, expected)?
+        != RefillOutcome::OverBudget
+    {
         return Err(CacheError::Malformed {
             reason: "refill budget",
         });
     }
-    let tenant = blocks[1].identity.tenant.as_bytes();
-    match refill_matching(&store, &pack.manifest_key, 2, &budget, tenant)? {
+    match refill_matching(&store, &pack.manifest_key, 2, &budget, expected)? {
         RefillOutcome::Loaded { payload } if payload == blocks[1].payload => {}
         _ => return Err(CacheError::ChecksumMismatch),
     }
-    if refill_matching(&store, &pack.manifest_key, 2, &budget, b"other-tenant").is_ok() {
+    let mut foreign = expected.clone();
+    foreign.tenant = TenantId::new(b"other-tenant".to_vec())?;
+    if refill_matching(&store, &pack.manifest_key, 2, &budget, &foreign).is_ok() {
         return Err(CacheError::Unauthorized);
     }
     let live = match live_probe().status {

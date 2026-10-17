@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use gpucache_core_types::CacheError;
+use gpucache_core_types::{CacheError, QuotaKind};
 
 use crate::directory::{Admit, FillNotice, FillRequest, ShardDirectory, ShardParams};
 
@@ -109,6 +109,7 @@ impl ControlPlane {
 
     /// Remove every member in `domain`. The last remaining member stays.
     /// In-flight fills are fenced and become misses. No payload is copied.
+    /// If the epoch cannot advance for the entire batch, nothing is changed.
     pub fn isolate_domain(&mut self, domain: u16) -> Result<u64, CacheError> {
         let victims: Vec<u64> = self
             .dir
@@ -125,6 +126,14 @@ impl ControlPlane {
         if victims.len() >= self.dir.members().len() {
             return Err(CacheError::FencingRejected { reason: "member" });
         }
+        // Each removal fences once. Reserve the entire epoch range before
+        // changing membership, domains, credits, or any in-flight notice.
+        self.dir
+            .epoch()
+            .checked_add(victims.len() as u64)
+            .ok_or(CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests,
+            })?;
         let mut epoch = self.dir.epoch();
         for node_id in victims {
             epoch = self.dir.remove_member(node_id)?;
@@ -219,6 +228,34 @@ mod tests {
         }
     }
 
+    fn three_member_plane(epoch: u64) -> ControlPlane {
+        let mut plane = ControlPlane::single_node(params());
+        plane.dir.note_member(2, 1).unwrap();
+        plane.dir.note_member(3, 1).unwrap();
+        plane.assign_domain(1, 7).unwrap();
+        plane.assign_domain(2, 7).unwrap();
+        plane.assign_domain(3, 9).unwrap();
+        plane.dir.set_epoch_for_test(epoch);
+        plane
+    }
+
+    fn begin_leader_and_waiter(plane: &mut ControlPlane) -> (u64, FillRequest, FillRequest) {
+        let leader = fill(plane.epoch());
+        let Admit::Leader { flight_id, .. } = plane.begin_or_join(&leader).unwrap() else {
+            panic!("leader");
+        };
+        let mut waiter = leader.clone();
+        waiter.request = 2u128.to_le_bytes();
+        assert_eq!(
+            plane.begin_or_join(&waiter).unwrap(),
+            Admit::Joined {
+                flight_id,
+                epoch: plane.epoch()
+            }
+        );
+        (flight_id, leader, waiter)
+    }
+
     #[test]
     fn rebalance_fences_the_source_and_starts_an_empty_destination() {
         let mut plane = ControlPlane::single_node(params());
@@ -288,6 +325,12 @@ mod tests {
         let node = plane.dir.members()[0].node_id;
         plane.assign_domain(node, 7).unwrap();
         plane.begin_or_join(&fill(1)).unwrap();
+        assert_eq!(
+            plane.isolate_domain(99).unwrap_err(),
+            CacheError::Malformed {
+                reason: "fault domain"
+            }
+        );
         let err = plane.isolate_domain(7).unwrap_err();
         assert_eq!(err, CacheError::FencingRejected { reason: "member" });
         assert_eq!(plane.inflight(), 1);
@@ -299,5 +342,114 @@ mod tests {
         assert!(epoch > 1);
         assert_eq!(plane.inflight(), 0);
         assert!(plane.dir.members().iter().all(|member| member.node_id != 9));
+    }
+
+    #[test]
+    fn isolate_domain_epoch_shortage_keeps_the_entire_batch_and_fills_unchanged() {
+        let mut plane = three_member_plane(u64::MAX - 1);
+        let (flight_id, leader, waiter) = begin_leader_and_waiter(&mut plane);
+        let members = plane.dir.members().to_vec();
+        let domains = plane.domains.clone();
+
+        assert_eq!(
+            plane.isolate_domain(7).unwrap_err(),
+            CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests
+            }
+        );
+        assert_eq!(plane.epoch(), u64::MAX - 1);
+        assert_eq!(plane.dir.members(), members);
+        assert_eq!(plane.domains, domains);
+        assert_eq!(plane.inflight(), 1);
+        assert_eq!(plane.credits_used(), leader.bytes);
+        assert!(plane.serving());
+        for request in [&leader, &waiter] {
+            assert_eq!(
+                plane.fill_notice(&request.tenant, request.request).unwrap(),
+                FillNotice::Pending
+            );
+        }
+        assert_eq!(
+            plane.begin_or_join(&leader).unwrap(),
+            Admit::Leader {
+                flight_id,
+                epoch: leader.epoch
+            }
+        );
+        assert_eq!(
+            plane.begin_or_join(&waiter).unwrap(),
+            Admit::Joined {
+                flight_id,
+                epoch: waiter.epoch
+            }
+        );
+        assert_eq!(plane.credits_used(), leader.bytes);
+        plane
+            .complete_flight(flight_id, leader.epoch, leader.request)
+            .unwrap();
+        assert_eq!(plane.credits_used(), 0);
+        assert_eq!(plane.inflight(), 0);
+    }
+
+    #[test]
+    fn isolate_domain_with_exact_epoch_budget_removes_every_victim_and_fences_fills() {
+        let mut plane = three_member_plane(u64::MAX - 2);
+        let (flight_id, leader, waiter) = begin_leader_and_waiter(&mut plane);
+
+        assert_eq!(plane.isolate_domain(7).unwrap(), u64::MAX);
+        assert_eq!(plane.epoch(), u64::MAX);
+        assert_eq!(plane.dir.members().len(), 1);
+        assert_eq!(plane.dir.members()[0].node_id, 3);
+        assert_eq!(plane.domains, BTreeMap::from([(3, 9)]));
+        assert_eq!(plane.inflight(), 0);
+        assert_eq!(plane.credits_used(), 0);
+        assert!(plane.serving());
+        for request in [&leader, &waiter] {
+            assert_eq!(
+                plane.fill_notice(&request.tenant, request.request).unwrap(),
+                FillNotice::Fenced
+            );
+        }
+        assert_eq!(
+            plane
+                .complete_flight(flight_id, leader.epoch, leader.request)
+                .unwrap_err(),
+            CacheError::EpochMismatch {
+                store: u64::MAX,
+                request: leader.epoch
+            }
+        );
+    }
+
+    #[test]
+    fn isolate_domain_at_epoch_max_keeps_a_single_victim_and_current_fills() {
+        let mut plane = three_member_plane(u64::MAX);
+        plane.assign_domain(2, 9).unwrap();
+        let (flight_id, leader, waiter) = begin_leader_and_waiter(&mut plane);
+        let members = plane.dir.members().to_vec();
+        let domains = plane.domains.clone();
+
+        assert_eq!(
+            plane.isolate_domain(7).unwrap_err(),
+            CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests
+            }
+        );
+        assert_eq!(plane.epoch(), u64::MAX);
+        assert_eq!(plane.dir.members(), members);
+        assert_eq!(plane.domains, domains);
+        assert_eq!(plane.inflight(), 1);
+        assert_eq!(plane.credits_used(), leader.bytes);
+        for request in [&leader, &waiter] {
+            assert_eq!(
+                plane.fill_notice(&request.tenant, request.request).unwrap(),
+                FillNotice::Pending
+            );
+        }
+        plane
+            .complete_flight(flight_id, leader.epoch, leader.request)
+            .unwrap();
+        assert_eq!(plane.inflight(), 0);
+        assert_eq!(plane.credits_used(), 0);
     }
 }

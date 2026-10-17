@@ -16,7 +16,7 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.85"
 authors = ["RustFS, Inc."]
-repository = "https://github.com/rustfs/gpucache"
+repository = "https://github.com/rustfs/GPUCache"
 
 [workspace.dependencies]
 sha2 = "=0.10.8"

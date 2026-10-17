@@ -11,10 +11,15 @@
 use std::collections::BTreeMap;
 
 use gpucache_core_types::{
-    content_checksum, verify_checksum, CacheError, Checksum, HARD_BYTES_CAP,
+    content_checksum, verify_checksum, BlockState, CacheError, Checksum, QuotaKind, HARD_BYTES_CAP,
 };
 
 use crate::degrade::{decide, DegradeDecision, Fault};
+
+// Bound queue-owned metadata independently of payload bytes. These are CPU
+// contract limits, not measured NIC queue or registration limits.
+const MAX_QUEUE_TASKS: usize = 4096;
+const MAX_SLAB_SLOTS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskId(pub u64);
@@ -85,7 +90,7 @@ impl Slab {
             .ok_or(CacheError::QuotaExceeded {
                 kind: gpucache_core_types::QuotaKind::RetainedBytes,
             })?;
-        if next > self.cap || self.next == u64::MAX {
+        if next > self.cap || self.next == u64::MAX || self.slots.len() >= MAX_SLAB_SLOTS {
             return Err(CacheError::QuotaExceeded {
                 kind: gpucache_core_types::QuotaKind::RetainedBytes,
             });
@@ -106,7 +111,7 @@ impl Slab {
         Ok(id)
     }
 
-    fn read(&mut self, tenant: &[u8], id: u64) -> Result<Vec<u8>, CacheError> {
+    fn readable_slot(&mut self, tenant: &[u8], id: u64) -> Result<&Slot, CacheError> {
         let Some(slot) = self.slots.get_mut(&id) else {
             return Err(CacheError::Storage {
                 reason: "clean miss",
@@ -124,7 +129,11 @@ impl Slab {
             slot.exposed = false;
             return Err(CacheError::ChecksumMismatch);
         }
-        Ok(slot.bytes.clone())
+        Ok(slot)
+    }
+
+    fn read(&mut self, tenant: &[u8], id: u64) -> Result<Vec<u8>, CacheError> {
+        Ok(self.readable_slot(tenant, id)?.bytes.clone())
     }
 
     fn hide_all(&mut self) {
@@ -144,10 +153,28 @@ enum Pending {
     Read { tenant: Vec<u8>, slot: u64 },
 }
 
+impl Pending {
+    fn write_bytes(&self) -> u64 {
+        match self {
+            Self::Write { payload, .. } => payload.len() as u64,
+            Self::Read { .. } => 0,
+        }
+    }
+
+    fn reads_slot(&self, tenant: &[u8], id: u64) -> bool {
+        matches!(self, Self::Read { tenant: owner, slot } if owner.as_slice() == tenant && *slot == id)
+    }
+}
+
+/// CPU-only storage task owner. Completion, failure, fault injection and drain
+/// attestations are trusted owner operations; a task id is not a tenant token.
+/// Returned payloads belong to the caller and are outside the queue's byte cap.
 pub struct StorageQueue {
     slab: Slab,
     pending: BTreeMap<u64, Pending>,
     pending_bytes: u64,
+    quarantined: BTreeMap<u64, Pending>,
+    quarantined_bytes: u64,
     next_task: u64,
     max_inflight: usize,
     control_up: bool,
@@ -155,13 +182,15 @@ pub struct StorageQueue {
 
 impl StorageQueue {
     pub fn open_simulated(cap_bytes: u64, max_inflight: usize) -> Result<Self, CacheError> {
-        if max_inflight == 0 {
+        if max_inflight == 0 || max_inflight > MAX_QUEUE_TASKS {
             return Err(CacheError::Malformed { reason: "dpu slab" });
         }
         Ok(Self {
             slab: Slab::new(cap_bytes)?,
             pending: BTreeMap::new(),
             pending_bytes: 0,
+            quarantined: BTreeMap::new(),
+            quarantined_bytes: 0,
             next_task: 1,
             max_inflight,
             control_up: true,
@@ -176,15 +205,37 @@ impl StorageQueue {
         self.pending.len()
     }
 
+    /// Tasks with unknown completion still hold their payloads and admission
+    /// credit until an explicit drain attestation or simulated restart fence.
+    pub fn quarantined(&self) -> usize {
+        self.quarantined.len()
+    }
+
+    /// All queue-owned payload bytes, including hidden slots and quarantine.
+    pub fn retained_bytes(&self) -> u64 {
+        self.slab.used + self.pending_bytes + self.quarantined_bytes
+    }
+
     pub fn submit_write(&mut self, tenant: &[u8], payload: &[u8]) -> Result<TaskId, CacheError> {
         self.admit(tenant, payload.len())?;
-        let next = self.pending_bytes.saturating_add(payload.len() as u64);
-        if next.saturating_add(self.slab.used) > self.slab.cap {
+        if self.retained_bytes() + payload.len() as u64 > self.slab.cap {
             return Err(CacheError::QuotaExceeded {
-                kind: gpucache_core_types::QuotaKind::RetainedBytes,
+                kind: QuotaKind::RetainedBytes,
             });
         }
-        self.pending_bytes = next;
+        let reserved_writes = self
+            .pending
+            .values()
+            .chain(self.quarantined.values())
+            .filter(|task| matches!(task, Pending::Write { .. }))
+            .count();
+        let reserved_slots = self.slab.slots.len() + reserved_writes;
+        if reserved_slots >= MAX_SLAB_SLOTS || reserved_writes as u64 >= u64::MAX - self.slab.next {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::RetainedBytes,
+            });
+        }
+        self.pending_bytes += payload.len() as u64;
         self.enqueue(Pending::Write {
             tenant: tenant.to_vec(),
             payload: payload.to_vec(),
@@ -193,6 +244,9 @@ impl StorageQueue {
 
     pub fn submit_read(&mut self, tenant: &[u8], slot: u64) -> Result<TaskId, CacheError> {
         self.admit(tenant, 1)?;
+        // Bind only to a slot that exists and is readable now. A guessed id
+        // must never become a read of a slot allocated by a later write.
+        self.slab.readable_slot(tenant, slot)?;
         self.enqueue(Pending::Read {
             tenant: tenant.to_vec(),
             slot,
@@ -200,6 +254,11 @@ impl StorageQueue {
     }
 
     pub fn complete(&mut self, task: TaskId) -> Result<Completion, CacheError> {
+        if self.quarantined.contains_key(&task.0) {
+            return Err(CacheError::FencingRejected {
+                reason: "task quarantined",
+            });
+        }
         let Some(pending) = self.pending.remove(&task.0) else {
             return Err(CacheError::UnknownGeneration);
         };
@@ -217,7 +276,14 @@ impl StorageQueue {
         Ok(self.receipt(task, slot, payload))
     }
 
+    /// Report a confirmed terminal failure. Unknown completion (including a
+    /// timeout or cancellation request) must use `quarantine` instead.
     pub fn fail(&mut self, task: TaskId) -> Result<(), CacheError> {
+        if self.quarantined.contains_key(&task.0) {
+            return Err(CacheError::FencingRejected {
+                reason: "task quarantined",
+            });
+        }
         let pending = self
             .pending
             .remove(&task.0)
@@ -228,28 +294,112 @@ impl StorageQueue {
         Ok(())
     }
 
+    pub fn quarantine(&mut self, task: TaskId) -> Result<(), CacheError> {
+        if self.quarantined.contains_key(&task.0) {
+            return Ok(());
+        }
+        let pending = self
+            .pending
+            .remove(&task.0)
+            .ok_or(CacheError::UnknownGeneration)?;
+        let bytes = pending.write_bytes();
+        self.pending_bytes -= bytes;
+        self.quarantined_bytes += bytes;
+        self.quarantined.insert(task.0, pending);
+        Ok(())
+    }
+
+    /// Trusted CPU simulation attestation that this task can no longer touch
+    /// its buffers. A timer or control-plane restoration is not an attestation.
+    /// A hardware backend would need a verified device drain before this call.
+    pub fn attest_drained(&mut self, task: TaskId) -> Result<(), CacheError> {
+        let pending = self
+            .quarantined
+            .remove(&task.0)
+            .ok_or(CacheError::UnknownGeneration)?;
+        self.quarantined_bytes -= pending.write_bytes();
+        Ok(())
+    }
+
+    /// Hide a tenant's slot. Already queued reads must observe the invalidation
+    /// at completion. The slot remains charged until it is safely reclaimed.
+    pub fn invalidate(&mut self, tenant: &[u8], slot: u64) -> Result<(), CacheError> {
+        self.check_control_and_tenant(tenant)?;
+        let stored = self
+            .slab
+            .slots
+            .get_mut(&slot)
+            .ok_or(CacheError::UnknownGeneration)?;
+        if stored.tenant.as_slice() != tenant {
+            return Err(CacheError::Unauthorized);
+        }
+        stored.exposed = false;
+        Ok(())
+    }
+
+    /// Reclaim an invalidated CPU slot only when no active or quarantined read
+    /// references it. This does not attest a hardware registration drain.
+    pub fn reclaim_invalidated(&mut self, tenant: &[u8], slot: u64) -> Result<(), CacheError> {
+        self.check_control_and_tenant(tenant)?;
+        let stored = self
+            .slab
+            .slots
+            .get(&slot)
+            .ok_or(CacheError::UnknownGeneration)?;
+        if stored.tenant.as_slice() != tenant {
+            return Err(CacheError::Unauthorized);
+        }
+        if stored.exposed {
+            return Err(CacheError::NotReclaimable {
+                from: BlockState::Committed,
+            });
+        }
+        let refs = self
+            .pending
+            .values()
+            .chain(self.quarantined.values())
+            .filter(|task| task.reads_slot(tenant, slot))
+            .count();
+        if refs > 0 {
+            return Err(CacheError::InUse { refs: refs as u32 });
+        }
+        let removed = self
+            .slab
+            .slots
+            .remove(&slot)
+            .ok_or(CacheError::UnknownGeneration)?;
+        self.slab.used -= removed.bytes.len() as u64;
+        Ok(())
+    }
+
+    fn quarantine_all(&mut self) {
+        self.quarantined.append(&mut self.pending);
+        self.quarantined_bytes += self.pending_bytes;
+        self.pending_bytes = 0;
+    }
+
     pub fn apply_fault(&mut self, fault: Fault) -> DegradeDecision {
         match fault {
             Fault::DpuRestart => {
+                // Explicit CPU epoch fence. Keep monotonic ids and do not
+                // restore control authority lost before this restart.
                 self.pending.clear();
                 self.pending_bytes = 0;
+                self.quarantined.clear();
+                self.quarantined_bytes = 0;
                 self.slab.restart();
-                self.control_up = true;
             }
             Fault::GpuReset | Fault::NicFlap | Fault::StorageLoss => {
-                self.pending.clear();
-                self.pending_bytes = 0;
+                self.quarantine_all();
                 self.slab.hide_all();
-                self.control_up = true;
             }
             Fault::NvmeTimeout => {
-                if let Some(id) = self.pending.keys().next().copied() {
-                    let _ = self.fail(TaskId(id));
-                }
+                // This fault has no task id, so no outstanding task can be
+                // assumed complete. Targeted failures use quarantine(task).
+                self.quarantine_all();
             }
             Fault::ControlPlaneLoss => {
-                self.pending.clear();
-                self.pending_bytes = 0;
+                self.quarantine_all();
                 self.slab.hide_all();
                 self.control_up = false;
             }
@@ -263,10 +413,8 @@ impl StorageQueue {
     }
 
     fn admit(&self, tenant: &[u8], len: usize) -> Result<(), CacheError> {
-        if !self.control_up {
-            return Err(CacheError::Cancelled);
-        }
-        if tenant.is_empty() || tenant.len() > 128 || len == 0 {
+        self.check_control_and_tenant(tenant)?;
+        if len == 0 {
             return Err(CacheError::Malformed { reason: "dpu task" });
         }
         if len > HARD_BYTES_CAP || len as u64 > self.slab.cap {
@@ -275,10 +423,22 @@ impl StorageQueue {
                 actual: len as u64,
             });
         }
-        if self.pending.len() >= self.max_inflight || self.next_task == u64::MAX {
+        if self.pending.len() + self.quarantined.len() >= self.max_inflight
+            || self.next_task == u64::MAX
+        {
             return Err(CacheError::QuotaExceeded {
                 kind: gpucache_core_types::QuotaKind::InFlightRequests,
             });
+        }
+        Ok(())
+    }
+
+    fn check_control_and_tenant(&self, tenant: &[u8]) -> Result<(), CacheError> {
+        if !self.control_up {
+            return Err(CacheError::Cancelled);
+        }
+        if tenant.is_empty() || tenant.len() > 128 {
+            return Err(CacheError::Malformed { reason: "dpu task" });
         }
         Ok(())
     }
@@ -372,9 +532,8 @@ mod tests {
         let read = queue.submit_read(b"tenant-a", slot).unwrap();
         let got = queue.complete(read).unwrap();
         assert_eq!(got.payload.as_deref(), Some(b"kv-block".as_slice()));
-        let foreign = queue.submit_read(b"tenant-b", slot).unwrap();
         assert_eq!(
-            queue.complete(foreign).unwrap_err(),
+            queue.submit_read(b"tenant-b", slot).unwrap_err(),
             CacheError::Unauthorized
         );
     }
@@ -385,9 +544,8 @@ mod tests {
         let write = queue.submit_write(b"tenant-a", b"secret-bytes").unwrap();
         queue.fail(write).unwrap();
         assert_eq!(queue.inflight(), 0);
-        let read = queue.submit_read(b"tenant-a", 1).unwrap();
         assert_eq!(
-            queue.complete(read).unwrap_err(),
+            queue.submit_read(b"tenant-a", 1).unwrap_err(),
             CacheError::Storage {
                 reason: "clean miss"
             }
@@ -396,11 +554,10 @@ mod tests {
 
     #[test]
     fn faults_miss_and_then_accept_new_work() {
-        let mut queue = StorageQueue::open_simulated(128, 4).unwrap();
-        let write = queue.submit_write(b"tenant-a", b"block").unwrap();
-        let wrote = queue.complete(write).unwrap();
-        let slot = wrote.slot.unwrap();
         for fault in all_faults() {
+            let mut queue = StorageQueue::open_simulated(128, 4).unwrap();
+            let write = queue.submit_write(b"tenant-a", b"block").unwrap();
+            let slot = queue.complete(write).unwrap().slot.unwrap();
             if matches!(fault, Fault::RustFsSlow | Fault::RustFsUnavailable) {
                 let before = queue.inflight();
                 let decision = queue.apply_fault(*fault);
@@ -410,13 +567,14 @@ mod tests {
                 assert_eq!(queue.inflight(), before);
                 continue;
             }
-            let _ = queue.submit_write(b"tenant-a", b"inflight");
+            let old_write = queue.submit_write(b"tenant-a", b"inflight").unwrap();
             let decision = queue.apply_fault(*fault);
             assert_eq!(decision.outcome, "CLEAN_MISS");
             assert!(decision.recompute);
             assert!(!decision.wrong_hit);
             assert!(!decision.blocked);
             assert_eq!(queue.inflight(), 0);
+            assert!(queue.complete(old_write).is_err());
             if *fault == Fault::ControlPlaneLoss {
                 assert!(!queue.control_up());
                 assert_eq!(
@@ -425,8 +583,15 @@ mod tests {
                 );
                 queue.restore_control();
             }
-            let read = queue.submit_read(b"tenant-a", slot).unwrap();
-            assert!(queue.complete(read).is_err());
+            if *fault == Fault::NvmeTimeout {
+                let read = queue.submit_read(b"tenant-a", slot).unwrap();
+                assert_eq!(
+                    queue.complete(read).unwrap().payload.as_deref(),
+                    Some(b"block".as_slice())
+                );
+            } else {
+                assert!(queue.submit_read(b"tenant-a", slot).is_err());
+            }
             let again = queue.submit_write(b"tenant-a", b"fresh").unwrap();
             let done = queue.complete(again).unwrap();
             assert!(done.payload.is_none());
@@ -443,14 +608,12 @@ mod tests {
             let stored = queue.slab.slots.get_mut(&slot).unwrap();
             stored.bytes[0] ^= 0xff;
         }
-        let read = queue.submit_read(b"tenant-a", slot).unwrap();
         assert_eq!(
-            queue.complete(read).unwrap_err(),
+            queue.submit_read(b"tenant-a", slot).unwrap_err(),
             CacheError::ChecksumMismatch
         );
-        let again = queue.submit_read(b"tenant-a", slot).unwrap();
         assert_eq!(
-            queue.complete(again).unwrap_err(),
+            queue.submit_read(b"tenant-a", slot).unwrap_err(),
             CacheError::Storage {
                 reason: "clean miss"
             }
@@ -479,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn faults_release_pending_credit_but_do_not_free_hidden_slots() {
+    fn faults_keep_unknown_writes_charged_until_drain_or_restart() {
         for fault in [
             Fault::DpuRestart,
             Fault::GpuReset,
@@ -491,16 +654,287 @@ mod tests {
             let mut queue = StorageQueue::open_simulated(8, 4).unwrap();
             let first = queue.submit_write(b"tenant-a", b"1234").unwrap();
             queue.complete(first).unwrap();
-            queue.submit_write(b"tenant-a", b"5678").unwrap();
+            let pending = queue.submit_write(b"tenant-a", b"5678").unwrap();
             queue.apply_fault(fault);
             assert_eq!(queue.pending_bytes, 0);
             if fault == Fault::ControlPlaneLoss {
                 queue.restore_control();
             }
-            queue.submit_write(b"tenant-a", b"5678").unwrap();
-            if fault != Fault::DpuRestart {
+            if fault == Fault::DpuRestart {
+                assert_eq!(queue.quarantined(), 0);
+                assert_eq!(queue.retained_bytes(), 0);
+            } else {
+                assert_eq!(queue.quarantined(), 1);
+                assert_eq!(queue.retained_bytes(), 8);
                 assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+                assert!(queue.complete(pending).is_err());
+                assert!(queue.fail(pending).is_err());
+                assert_eq!(queue.retained_bytes(), 8);
+                queue.attest_drained(pending).unwrap();
+                assert_eq!(queue.retained_bytes(), 4);
             }
+            queue.submit_write(b"tenant-a", b"5678").unwrap();
         }
+    }
+
+    #[test]
+    fn timeout_quarantines_every_affected_task_and_late_completion_never_publishes() {
+        let mut queue = StorageQueue::open_simulated(8, 2).unwrap();
+        let first = queue.submit_write(b"tenant-a", b"1234").unwrap();
+        let second = queue.submit_write(b"tenant-b", b"5678").unwrap();
+        queue.apply_fault(Fault::NvmeTimeout);
+        assert_eq!(queue.inflight(), 0);
+        assert_eq!(queue.quarantined(), 2);
+        assert_eq!(queue.retained_bytes(), 8);
+        for task in [first, second] {
+            queue.quarantine(task).unwrap();
+            assert_eq!(
+                queue.complete(task).unwrap_err(),
+                CacheError::FencingRejected {
+                    reason: "task quarantined"
+                }
+            );
+        }
+        assert!(queue.slab.slots.is_empty());
+        assert!(matches!(
+            queue.submit_read(b"tenant-a", 1),
+            Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests
+            })
+        ));
+        queue.attest_drained(first).unwrap();
+        assert_eq!(queue.retained_bytes(), 4);
+        let next = queue.submit_write(b"tenant-a", b"abcd").unwrap();
+        let slot = queue.complete(next).unwrap().slot.unwrap();
+        assert_eq!(queue.slab.slots[&slot].tenant, b"tenant-a");
+        assert_eq!(queue.retained_bytes(), 8);
+        assert_eq!(
+            queue.attest_drained(first).unwrap_err(),
+            CacheError::UnknownGeneration
+        );
+    }
+
+    #[test]
+    fn repeated_faults_preserve_exact_quarantine_credit_and_require_a_drain() {
+        let mut queue = StorageQueue::open_simulated(8, 2).unwrap();
+        let write = queue.submit_write(b"tenant-a", b"12345678").unwrap();
+        assert_eq!(
+            queue.attest_drained(write).unwrap_err(),
+            CacheError::UnknownGeneration
+        );
+        assert_eq!(queue.inflight(), 1);
+        for fault in [
+            Fault::NvmeTimeout,
+            Fault::NvmeTimeout,
+            Fault::NicFlap,
+            Fault::StorageLoss,
+            Fault::GpuReset,
+        ] {
+            queue.apply_fault(fault);
+            assert_eq!(queue.quarantined(), 1);
+            assert_eq!(queue.retained_bytes(), 8);
+            assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+        }
+        queue.attest_drained(write).unwrap();
+        assert_eq!(queue.quarantined(), 0);
+        assert_eq!(queue.retained_bytes(), 0);
+        assert!(queue.complete(write).is_err());
+        queue.submit_write(b"tenant-a", b"12345678").unwrap();
+    }
+
+    #[test]
+    fn unrelated_faults_never_restore_lost_control_authority() {
+        let mut queue = StorageQueue::open_simulated(16, 4).unwrap();
+        let write = queue.submit_write(b"tenant-a", b"1234").unwrap();
+        queue.apply_fault(Fault::ControlPlaneLoss);
+        for fault in all_faults() {
+            queue.apply_fault(*fault);
+            assert!(!queue.control_up());
+            assert_eq!(
+                queue.submit_write(b"tenant-a", b"x").unwrap_err(),
+                CacheError::Cancelled
+            );
+        }
+        queue.restore_control();
+        assert!(queue.complete(write).is_err());
+        let new = queue.submit_write(b"tenant-a", b"fresh").unwrap();
+        queue.complete(new).unwrap();
+    }
+
+    #[test]
+    fn control_restore_keeps_quarantine_and_hidden_slots() {
+        let mut queue = StorageQueue::open_simulated(8, 2).unwrap();
+        let write = queue.submit_write(b"tenant-a", b"1234").unwrap();
+        let slot = queue.complete(write).unwrap().slot.unwrap();
+        let pending = queue.submit_write(b"tenant-a", b"5678").unwrap();
+        queue.apply_fault(Fault::ControlPlaneLoss);
+        queue.restore_control();
+        assert_eq!(queue.quarantined(), 1);
+        assert_eq!(queue.retained_bytes(), 8);
+        assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+        assert!(queue.submit_read(b"tenant-a", slot).is_err());
+        assert!(queue.complete(pending).is_err());
+    }
+
+    #[test]
+    fn invalidation_is_tenant_scoped_and_queued_reads_cannot_escape_it() {
+        let mut queue = StorageQueue::open_simulated(8, 4).unwrap();
+        let write = queue.submit_write(b"tenant-a", b"12345678").unwrap();
+        let slot = queue.complete(write).unwrap().slot.unwrap();
+        assert_eq!(
+            queue.invalidate(b"tenant-b", slot).unwrap_err(),
+            CacheError::Unauthorized
+        );
+        assert!(queue.slab.slots[&slot].exposed);
+        assert_eq!(
+            queue.reclaim_invalidated(b"tenant-b", slot).unwrap_err(),
+            CacheError::Unauthorized
+        );
+        assert!(matches!(
+            queue.reclaim_invalidated(b"tenant-a", slot),
+            Err(CacheError::NotReclaimable { .. })
+        ));
+        let read = queue.submit_read(b"tenant-a", slot).unwrap();
+        queue.invalidate(b"tenant-a", slot).unwrap();
+        assert_eq!(
+            queue.reclaim_invalidated(b"tenant-a", slot).unwrap_err(),
+            CacheError::InUse { refs: 1 }
+        );
+        assert!(queue.complete(read).is_err());
+        queue.reclaim_invalidated(b"tenant-a", slot).unwrap();
+        assert_eq!(queue.retained_bytes(), 0);
+        let next = queue.submit_write(b"tenant-b", b"new-data").unwrap();
+        let new_slot = queue.complete(next).unwrap().slot.unwrap();
+        assert_ne!(new_slot, slot);
+        assert!(queue.submit_read(b"tenant-a", slot).is_err());
+    }
+
+    #[test]
+    fn quarantined_reads_prevent_reclamation_until_attested_drained() {
+        let mut queue = StorageQueue::open_simulated(8, 2).unwrap();
+        let write = queue.submit_write(b"tenant-a", b"12345678").unwrap();
+        let slot = queue.complete(write).unwrap().slot.unwrap();
+        let read = queue.submit_read(b"tenant-a", slot).unwrap();
+        queue.apply_fault(Fault::NicFlap);
+        assert_eq!(queue.quarantined(), 1);
+        assert_eq!(
+            queue.reclaim_invalidated(b"tenant-a", slot).unwrap_err(),
+            CacheError::InUse { refs: 1 }
+        );
+        queue.attest_drained(read).unwrap();
+        queue.reclaim_invalidated(b"tenant-a", slot).unwrap();
+        assert_eq!(queue.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn restart_fences_old_task_and_slot_ids_without_reusing_them() {
+        let mut queue = StorageQueue::open_simulated(16, 4).unwrap();
+        let write = queue.submit_write(b"tenant-a", b"1234").unwrap();
+        let old_slot = queue.complete(write).unwrap().slot.unwrap();
+        let old_write = queue.submit_write(b"tenant-a", b"5678").unwrap();
+        let old_read = queue.submit_read(b"tenant-a", old_slot).unwrap();
+        queue.apply_fault(Fault::NicFlap);
+        queue.apply_fault(Fault::DpuRestart);
+        assert_eq!(queue.retained_bytes(), 0);
+        assert_eq!(queue.quarantined(), 0);
+        let new_write = queue.submit_write(b"tenant-b", b"new-data").unwrap();
+        let new_slot = queue.complete(new_write).unwrap().slot.unwrap();
+        assert!(new_write.0 > old_read.0);
+        assert!(new_slot > old_slot);
+        for task in [write, old_write, old_read] {
+            assert_eq!(
+                queue.complete(task).unwrap_err(),
+                CacheError::UnknownGeneration
+            );
+        }
+        assert!(queue.submit_read(b"tenant-a", old_slot).is_err());
+        assert_eq!(queue.retained_bytes(), 8);
+    }
+
+    #[test]
+    fn queue_and_slot_metadata_have_independent_hard_bounds() {
+        assert!(StorageQueue::open_simulated(16, MAX_QUEUE_TASKS + 1).is_err());
+        let mut queue = StorageQueue::open_simulated(8192, 2).unwrap();
+        for _ in 0..MAX_SLAB_SLOTS - 1 {
+            let task = queue.submit_write(b"tenant-a", b"x").unwrap();
+            queue.complete(task).unwrap();
+        }
+        let last = queue.submit_write(b"tenant-a", b"x").unwrap();
+        // Reserve the metadata slot when admitting the write, not at complete.
+        assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+        queue.quarantine(last).unwrap();
+        assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+        queue.attest_drained(last).unwrap();
+        let last = queue.submit_write(b"tenant-a", b"x").unwrap();
+        queue.complete(last).unwrap();
+        assert_eq!(queue.slab.slots.len(), MAX_SLAB_SLOTS);
+        assert!(queue.retained_bytes() < queue.slab.cap);
+        assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+    }
+
+    #[test]
+    fn nonexistent_read_cannot_bind_to_a_future_slot() {
+        let mut queue = StorageQueue::open_simulated(8, 2).unwrap();
+        assert_eq!(
+            queue.submit_read(b"tenant-a", 1).unwrap_err(),
+            CacheError::Storage {
+                reason: "clean miss"
+            }
+        );
+        assert_eq!(queue.inflight(), 0);
+        assert_eq!(queue.next_task, 1);
+        let write = queue.submit_write(b"tenant-a", b"new-data").unwrap();
+        let slot = queue.complete(write).unwrap().slot.unwrap();
+        assert_eq!(slot, 1);
+        assert_eq!(queue.inflight(), 0);
+        let read = queue.submit_read(b"tenant-a", slot).unwrap();
+        assert_eq!(
+            queue.complete(read).unwrap().payload.as_deref(),
+            Some(b"new-data".as_slice())
+        );
+        queue.invalidate(b"tenant-a", slot).unwrap();
+        assert!(queue.submit_read(b"tenant-a", slot).is_err());
+        assert_eq!(queue.inflight(), 0);
+    }
+
+    #[test]
+    fn checksum_is_rechecked_after_read_admission() {
+        let mut queue = StorageQueue::open_simulated(8, 2).unwrap();
+        let write = queue.submit_write(b"tenant-a", b"new-data").unwrap();
+        let slot = queue.complete(write).unwrap().slot.unwrap();
+        let read = queue.submit_read(b"tenant-a", slot).unwrap();
+        queue.slab.slots.get_mut(&slot).unwrap().bytes[0] ^= 0xff;
+        assert_eq!(
+            queue.complete(read).unwrap_err(),
+            CacheError::ChecksumMismatch
+        );
+        assert_eq!(queue.inflight(), 0);
+        assert!(!queue.slab.slots[&slot].exposed);
+        assert!(queue.submit_read(b"tenant-a", slot).is_err());
+    }
+
+    #[test]
+    fn malformed_inputs_and_exhausted_ids_do_not_consume_credit() {
+        let mut queue = StorageQueue::open_simulated(8, 2).unwrap();
+        for tenant in [&b""[..], &[b'a'; 129][..]] {
+            assert!(queue.submit_write(tenant, b"x").is_err());
+            assert!(queue.submit_read(tenant, 1).is_err());
+        }
+        assert!(queue.submit_write(b"tenant-a", b"").is_err());
+        assert!(queue.submit_write(b"tenant-a", b"123456789").is_err());
+        queue.next_task = u64::MAX;
+        assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+        assert_eq!(queue.inflight(), 0);
+        assert_eq!(queue.retained_bytes(), 0);
+        queue.next_task = 1;
+        queue.slab.next = u64::MAX;
+        assert!(queue.submit_write(b"tenant-a", b"x").is_err());
+        assert_eq!(queue.retained_bytes(), 0);
+        queue.slab.next = u64::MAX - 1;
+        let last = queue.submit_write(b"tenant-a", b"x").unwrap();
+        assert!(queue.submit_write(b"tenant-a", b"y").is_err());
+        assert_eq!(queue.retained_bytes(), 1);
+        assert_eq!(queue.complete(last).unwrap().slot, Some(u64::MAX - 1));
+        assert!(queue.submit_write(b"tenant-a", b"z").is_err());
     }
 }

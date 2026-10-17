@@ -15,6 +15,36 @@ use crate::{MemoryStore, ReclaimRequest};
 
 const FP: [u8; 32] = [9u8; 32];
 
+#[test]
+fn direct_policy_construction_cannot_enable_a_zero_credential() {
+    let identity = synthetic_identity(1, 1);
+    let policy = TenantPolicy {
+        tenant: identity.tenant,
+        trust_domain: identity.trust_domain,
+        credential_fingerprint: [0; 32],
+    };
+    assert!(matches!(
+        MemoryStore::new(limits(), vec![policy]),
+        Err(CacheError::Unauthorized)
+    ));
+}
+
+#[test]
+fn mutated_auth_context_is_rejected_at_the_store_boundary() {
+    let (mut store, mut auth) = open(None);
+    auth.credential_fingerprint = [0; 32];
+    let reply = store.lookup(
+        &auth,
+        0,
+        vec![LookupItem {
+            header: hdr(&store, 1, 0),
+            identity: synthetic_identity(1, 1),
+        }],
+    );
+    assert_eq!(reply, Err(CacheError::Unauthorized));
+    assert_eq!(store.stats().retained_bytes, 0);
+}
+
 fn limits() -> ResourceLimits {
     ResourceLimits::dev_defaults()
 }

@@ -29,7 +29,7 @@ V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated regist
 | V3: one candidate offload (storage queue) and ablation stubs | Interface only. P2P, DPA, compression, and crypto offload stay `NOT_RUN_HARDWARE` when enabled. Hot-tier EC cannot be enabled |
 | V3: authz, replay window, integrity seal, rate limit, secret rotation, audit | CPU hooks in this tree. Not mTLS. Trusted-fabric boundary is [docs/adr/0007-trusted-fabric.md](docs/adr/0007-trusted-fabric.md) |
 | V3: rebalance, rolling upgrade, fault-domain isolation | In-process stubs on the V2 shard directory. They fence fills. They do not copy a replica |
-| V3: degrade matrix (DPU restart, GPU reset, NIC flap, storage loss, NVMe timeout, control-plane loss, RustFS slow/down) | Simulated fault decisions request recompute. Hidden slab bytes remain charged and can exhaust capacity until explicit restart; recovery is not proven on hardware |
+| V3: degrade matrix (DPU restart, GPU reset, NIC flap, storage loss, NVMe timeout, control-plane loss, RustFS slow/down) | Simulated fault decisions request recompute. Unknown completions remain quarantined and charged until explicit drain. Tenant-scoped invalidation/reclaim cannot free referenced slots. Recovery is not proven on hardware |
 | V3: G4 retention, manifest version, reclaim, delete verification, tenant cold keys, backfill budget | Implemented against the mock. Live RustFS is `NOT_RUN_HARDWARE` |
 | V3: paired NIC-RDMA baseline vs DPU | `NOT_RUN_HARDWARE`. `tco=TCO_UNKNOWN`. `go_gate=NOT_EVALUATED`. TCP is not the DPU baseline |
 | V3: second engine (SGLang / HiCache) | Not added. Evaluation note only. See [docs/adr/0008-second-engine.md](docs/adr/0008-second-engine.md) |
@@ -69,6 +69,16 @@ A failed or timed-out registered region goes to `QUARANTINED`. Lease expiry does
 Resource limits cover object size, writer admissions, memory registrations, per-tenant in-flight bytes, and retained payload bytes. They are not a complete process-RSS bound: reader pins, protocol reply allocations, and some auxiliary metadata still need admission limits. The idempotency table is bounded and scoped by authenticated tenant and trust domain.
 
 ## What you can run
+
+For an unattended VM or Grok bot regression, run:
+
+```bash
+python3 scripts/ci/vm_regression.py --profile cpu --output artifacts/vm-regression
+```
+
+The runner checks the locked dependency contract, formatting, Clippy, workspace and doc tests, optional and combined features, and CPU demos. It writes JSON, JUnit, a summary and per-gate logs. Hardware profiles return `NOT_RUN_HARDWARE` and exit 2; a CPU pass does not qualify RDMA, GDS, a GPU engine or BF3. Live RustFS access is disabled for this profile, including Cargo-configured endpoints. See the [VM runbook](docs/VM_REGRESSION.md), [staged roadmap](docs/ROADMAP.md), [replacement strategy](docs/REPLACEMENT_STRATEGY.md), and [English PR plan](docs/PR_PLAN.md).
+
+V3 regression hardening rejects active replay-window eviction, cross-domain replay, retired credential revival and malformed identities. TCP replies must match the operation, epoch and ordered request IDs before a connection can be reused. The DPU queue simulation bounds task/slot counts and retains unknown-completion credits; these checks do not constitute device isolation or hardware drain.
 
 From a clean checkout, with Rust stable (MSRV 1.85):
 

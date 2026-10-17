@@ -14,28 +14,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-targets
-      - name: Fallback demo
-        run: cargo run -p gpucache-transport --bin fault-demo --quiet
-      - name: Paired baseline stub
-        run: cargo run -p gpucache-bench --bin paired-baseline --quiet
-      - name: Shard and cold demos
-        run: |
-          cargo run -p gpucache-transport --bin shard-demo --quiet
-          cargo run -p gpucache-cold --bin cold-demo --quiet
-      - name: V3 DPU contract and paired gate
-        run: |
-          cargo run -p gpucache-dpu --bin dpu-demo --quiet
-          cargo run -p gpucache-bench --bin v3-paired --quiet
-      - name: Optional RDMA feature still skips hardware
-        run: cargo test -p gpucache-transport --all-targets --features rdma-nixl
-      - name: Optional DPU feature still skips hardware
-        run: cargo test -p gpucache-dpu --all-targets --features dpu-bf3
+      - name: Reproducible CPU VM regression
+        run: python3 scripts/ci/vm_regression.py --profile cpu --output artifacts/vm-regression
+      - name: Retain regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-vm-regression-x86_64
+          path: artifacts/vm-regression/
+          if-no-files-found: error
+          retention-days: 14
       - name: Reject accelerator linkage and erasure coding
         run: |
           python3 - <<'PY'
@@ -83,7 +71,7 @@ jobs:
       - name: Test
         run: |
           echo "aarch64 cargo test is a CPU build. It is not a BlueField or DOCA run."
-          cargo test --workspace --all-targets
+          cargo test --workspace --all-targets --locked
 
   test-aarch64-qemu:
     name: test (aarch64 qemu-user)
@@ -102,4 +90,4 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
-        run: cargo test --workspace --all-targets --target aarch64-unknown-linux-gnu
+        run: cargo test --workspace --all-targets --locked --target aarch64-unknown-linux-gnu

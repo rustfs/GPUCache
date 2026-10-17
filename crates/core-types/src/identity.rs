@@ -209,6 +209,15 @@ impl CacheIdentity {
         Self::decode_body(bytes, false)
     }
 
+    /// Validate protocol hard limits independently of tighter store quotas.
+    pub fn validate_wire(&self) -> Result<(), CacheError> {
+        self.validate(&IdentityLimits {
+            max_field_bytes: crate::limits::DEFAULT_MAX_FIELD_BYTES,
+            max_prefix_links: 4096,
+            max_block_tokens: u32::MAX,
+        })
+    }
+
     pub fn validate(&self, limits: &IdentityLimits) -> Result<(), CacheError> {
         if self.version != IDENTITY_VERSION {
             return Err(CacheError::IdentityInvalid {
@@ -483,6 +492,9 @@ impl CacheIdentity {
                 reason: "physical field on logical key",
             });
         }
+        // Syntax alone is insufficient: callers also decode exports and keys
+        // without passing through a store's admission checks.
+        id.validate_wire()?;
         Ok(id)
     }
 }
@@ -666,4 +678,120 @@ pub fn logical_fields_diverge(a: &CacheIdentity, b: &CacheIdentity) -> bool {
         || a.adapter != b.adapter
         || a.prefix_chain != b.prefix_chain
         || a.multimodal != b.multimodal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{decode_physical_key, encode_physical_key, synthetic_identity, ResourceLimits};
+
+    #[test]
+    fn identity_decoder_rejects_structurally_encoded_invalid_identity() {
+        let base = synthetic_identity(1, 1);
+        let mut cases = Vec::new();
+        let mut id = base.clone();
+        id.layout.family = 0;
+        cases.push(id);
+        let mut id = base.clone();
+        id.shard.tp_rank = id.shard.tp_size;
+        cases.push(id);
+        let mut id = base.clone();
+        id.block_token_count = 0;
+        cases.push(id);
+        let mut id = base.clone();
+        id.valid_length = id.block_token_count + 1;
+        cases.push(id);
+        let mut id = base;
+        id.rope.scaling_factor_bits = 1.0f64.to_bits();
+        cases.push(id);
+        for id in cases {
+            let bytes = id.encode_body(false).unwrap();
+            assert!(matches!(
+                CacheIdentity::from_bytes(&bytes),
+                Err(CacheError::IdentityInvalid { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn wire_validation_preserves_hard_bounds_without_imposing_store_defaults() {
+        let mut id = synthetic_identity(1, 1);
+        id.block_token_count = u32::MAX;
+        id.valid_length = u32::MAX;
+        id.prefix_chain = vec![Digest([1; 32]); 4096];
+        assert_eq!(
+            CacheIdentity::from_bytes(&id.to_bytes().unwrap()).unwrap(),
+            id
+        );
+        id.prefix_chain.push(Digest([2; 32]));
+        assert!(id.validate_wire().is_err());
+        assert!(CacheIdentity::from_bytes(&id.to_bytes().unwrap()).is_err());
+    }
+
+    #[test]
+    fn physical_keys_separate_all_security_and_layout_fields() {
+        let base = synthetic_identity(1, 1);
+        let mut variants = Vec::new();
+        let mut changed = base.clone();
+        changed.tenant = TenantId::new(b"other-tenant".to_vec()).unwrap();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.trust_domain = TrustDomain::new(b"other-trust".to_vec()).unwrap();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.model_revision = Digest([9; 32]);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.model_config_hash = Digest([9; 32]);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.tokenizer_revision = Digest([9; 32]);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.adapter = AdapterIdentity::Lora {
+            revision: Digest([9; 32]),
+        };
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.kv_dtype = KvDtype::F16;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.quant_format = QuantFormat::Fp8;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.layout.minor += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.shard.tp_size = 2;
+        changed.shard.tp_rank = 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.position = PositionEncoding::Absolute;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.rope.theta_bits = 500_000.0f64.to_bits();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.prefix_chain[0] = Digest([9; 32]);
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.block_token_count += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.valid_length -= 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.multimodal = Some(MultimodalIdentity {
+            processor_revision: Digest([8; 32]),
+            input_digest: Digest([9; 32]),
+        });
+        variants.push(changed);
+        let limits = IdentityLimits::from_resources(&ResourceLimits::dev_defaults());
+        let key = encode_physical_key(&base, &limits).unwrap();
+        for changed in variants {
+            let other_key = encode_physical_key(&changed, &limits).unwrap();
+            assert_ne!(key, other_key);
+            assert_eq!(decode_physical_key(&other_key).unwrap(), changed);
+        }
+    }
 }

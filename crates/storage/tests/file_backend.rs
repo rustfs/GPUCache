@@ -155,6 +155,24 @@ fn empty_policy_is_refused() {
 }
 
 #[test]
+fn exhausted_restart_epoch_is_rejected_without_reusing_the_old_epoch() {
+    let dir = TempDir::new();
+    let (policy, _) = policy(1, FP_A);
+    drop(FileStore::open(&dir.path, limits(64, 64), vec![policy.clone()]).unwrap());
+    let path = dir.path.join("MANIFEST");
+    let mut manifest = fs::read(&path).unwrap();
+    manifest[6..14].copy_from_slice(&u64::MAX.to_le_bytes());
+    fs::write(&path, &manifest).unwrap();
+    assert!(matches!(
+        must_err(FileStore::open(&dir.path, limits(64, 64), vec![policy])),
+        CacheError::FencingRejected {
+            reason: "epoch exhausted"
+        }
+    ));
+    assert_eq!(fs::read(path).unwrap(), manifest);
+}
+
+#[test]
 fn restart_reloads_committed_bytes_and_bumps_epoch() {
     let dir = TempDir::new();
     let (policy, auth) = policy(1, FP_A);

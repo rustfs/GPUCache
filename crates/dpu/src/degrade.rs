@@ -4,8 +4,10 @@
 //! Failure outcomes for the V3 degrade matrix.
 //!
 //! Every listed fault is a clean miss. The engine recomputes. The decision
-//! carries no payload, does not report a wrong hit, and does not stick in a
-//! permanent block. Device-side effects live on `StorageQueue::apply_fault`.
+//! carries no payload and does not report a wrong hit. `blocked=false` means
+//! the caller may fall back to recompute; it does not promise queue admission.
+//! Unknown completions retain quarantine credit until explicit drain or a
+//! simulated restart fence. Effects live on `StorageQueue::apply_fault`.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {

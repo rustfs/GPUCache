@@ -39,7 +39,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ```
 
-The runner uses `--locked` for Cargo resolution, checks Clippy with all features, checks the dependency contract and runner unit tests, runs doc tests and combined-feature tests, and exercises the CPU-compatible `rdma-nixl` and `dpu-bf3` feature slots. It also runs the reuse, fallback, shard, cold, DPU and paired-report demos. The current list contains 16 gates; the command list in `results.json` is authoritative for a retained run. Optional feature compilation does not link a device, and a demo's successful exit does not convert an unavailable hardware row into a pass.
+The runner uses `--locked` for Cargo resolution and fetches the locked dependencies before its offline metadata check, so a clean VM does not need an already populated cache unless `--offline` is selected. It checks Clippy with default and all features, checks the dependency contract and runner unit tests, runs doc tests and combined-feature tests, and exercises the CPU-compatible `rdma-nixl` and `dpu-bf3` feature slots. It also runs the reuse, fallback, shard, cold, DPU and paired-report demos. The current list contains 18 gates; the command list in `results.json` is authoritative for a retained run. Optional feature compilation does not link a device, and a demo's successful exit does not convert an unavailable hardware row into a pass.
 
 Manual reproduction of the optional feature contracts is:
 

@@ -130,6 +130,11 @@ class PlanTests(unittest.TestCase):
                      "fault-demo", "cold-demo", "dpu-demo", "v3-paired"):
             self.assertIn(name, names)
 
+    def test_clean_vm_fetches_locked_dependencies_before_offline_metadata(self):
+        names = [gate.name for gate in vm.cpu_gates()]
+        self.assertLess(names.index("locked-dependencies"), names.index("dependency-contract"))
+        self.assertIn("clippy-default", names)
+
     def test_invalid_timeouts_are_rejected(self):
         for value in ("0", "-1", "nan", "inf"):
             with self.assertRaises(vm.argparse.ArgumentTypeError):

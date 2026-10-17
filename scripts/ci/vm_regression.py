@@ -50,10 +50,13 @@ def cpu_gates(offline=False):
     locked = ("--locked",) + (("--offline",) if offline else ())
     gates = [
         Gate("format", cargo + ("fmt", "--all", "--", "--check")),
+        Gate("locked-dependencies", cargo + ("fetch",) + locked),
         Gate("dependency-contract", (sys.executable, "scripts/ci/check_contract.py"),
              ("status=CPU_DEPENDENCY_CONTRACT_OK",)),
         Gate("runner-tests", (sys.executable, "-m", "unittest", "discover",
                               "-s", "scripts/ci/tests", "-v")),
+        Gate("clippy-default", cargo + ("clippy", "--workspace", "--all-targets")
+             + locked + ("--", "-D", "warnings")),
         Gate("clippy", cargo + ("clippy", "--workspace", "--all-targets", "--all-features")
              + locked + ("--", "-D", "warnings")),
         Gate("workspace-tests", cargo + ("test", "--workspace", "--all-targets") + locked),

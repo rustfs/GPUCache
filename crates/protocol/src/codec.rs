@@ -50,6 +50,11 @@ pub struct CommittedExport {
 }
 
 pub fn encode_request(auth: &AuthContext, body: &RequestBody) -> Result<Vec<u8>, CacheError> {
+    if body.len() > MAX_ITEMS {
+        return Err(CacheError::QuotaExceeded {
+            kind: gpucache_core_types::QuotaKind::BatchItems,
+        });
+    }
     let mut w = ByteWriter::with_capacity(128);
     w.raw(WIRE_MAGIC);
     w.u16(WIRE_VERSION);
@@ -215,7 +220,7 @@ pub fn decode_request(bytes: &[u8]) -> Result<(AuthContext, RequestBody), CacheE
 }
 
 pub fn encode_hello(versions: &[u16]) -> Result<Vec<u8>, CacheError> {
-    if versions.len() > 32 {
+    if versions.is_empty() || versions.len() > 32 {
         return Err(CacheError::Malformed {
             reason: "hello versions",
         });
@@ -343,6 +348,7 @@ pub fn request_op(body: &RequestBody) -> u16 {
 }
 
 fn write_auth(w: &mut ByteWriter, auth: &AuthContext) -> Result<(), CacheError> {
+    auth.validate()?;
     w.bytes(auth.tenant.as_bytes())?;
     w.bytes(auth.trust_domain.as_bytes())?;
     w.raw(&auth.credential_fingerprint);
@@ -357,6 +363,7 @@ fn read_auth(r: &mut ByteReader<'_>) -> Result<AuthContext, CacheError> {
 }
 
 fn write_header(w: &mut ByteWriter, header: &ItemHeader) -> Result<(), CacheError> {
+    RequestId::new(header.request_id.0)?;
     w.raw(&header.request_id.0);
     w.u64(header.epoch);
     w.u64(header.deadline_ms);
@@ -374,6 +381,7 @@ fn read_header(r: &mut ByteReader<'_>) -> Result<ItemHeader, CacheError> {
 }
 
 fn write_identity(w: &mut ByteWriter, id: &CacheIdentity) -> Result<(), CacheError> {
+    id.validate_wire()?;
     w.bytes(&id.to_bytes()?)
 }
 
@@ -429,6 +437,7 @@ fn write_opt_request(w: &mut ByteWriter, value: Option<RequestId>) -> Result<(),
     match value {
         None => w.u8(0),
         Some(id) => {
+            RequestId::new(id.0)?;
             w.u8(1);
             w.raw(&id.0);
         }
@@ -589,5 +598,73 @@ mod tests {
             let (_, back) = decode_request(&bytes).unwrap();
             assert_eq!(back, body);
         }
+    }
+
+    #[test]
+    fn encoder_rejects_public_auth_and_request_id_constructor_bypasses() {
+        let mut invalid_auth = auth();
+        invalid_auth.credential_fingerprint = [0; 32];
+        let body = RequestBody::Lookup(vec![LookupItem {
+            header: header(1),
+            identity: synthetic_identity(1, 1),
+        }]);
+        assert_eq!(
+            encode_request(&invalid_auth, &body),
+            Err(CacheError::Unauthorized)
+        );
+        let mut bad_header = header(1);
+        bad_header.request_id = RequestId([0; 16]);
+        let body = RequestBody::Lookup(vec![LookupItem {
+            header: bad_header,
+            identity: synthetic_identity(1, 1),
+        }]);
+        assert!(matches!(
+            encode_request(&auth(), &body),
+            Err(CacheError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn encoder_does_not_emit_oversized_batches_or_empty_negotiation() {
+        let item = LookupItem {
+            header: header(1),
+            identity: synthetic_identity(1, 1),
+        };
+        assert_eq!(
+            encode_request(&auth(), &RequestBody::Lookup(vec![item; MAX_ITEMS + 1])),
+            Err(CacheError::QuotaExceeded {
+                kind: gpucache_core_types::QuotaKind::BatchItems,
+            })
+        );
+        assert!(encode_hello(&[]).is_err());
+    }
+
+    #[test]
+    fn export_does_not_accept_invalid_identity_with_a_valid_payload_checksum() {
+        let payload = b"valid-payload".to_vec();
+        let mut identity = synthetic_identity(1, 1);
+        identity.valid_length = 0;
+        let frame = CommittedExport {
+            identity: identity.clone(),
+            source_generation: 1,
+            checksum: content_checksum(&payload),
+            payload: payload.clone(),
+        };
+        assert!(encode_export(&frame).is_err());
+
+        // Build a hostile frame without the checked encoder.
+        let mut w = ByteWriter::new();
+        w.raw(EXPORT_MAGIC);
+        w.u16(EXPORT_VERSION);
+        w.bytes(&identity.to_bytes().unwrap()).unwrap();
+        w.u64(1);
+        w.raw(&content_checksum(&payload).0);
+        w.bytes(&payload).unwrap();
+        assert_eq!(
+            decode_export(&w.finish()),
+            Err(CacheError::IdentityInvalid {
+                reason: "valid length"
+            })
+        );
     }
 }

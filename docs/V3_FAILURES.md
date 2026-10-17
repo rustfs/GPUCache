@@ -4,11 +4,11 @@ Each row is a clean miss. The engine recomputes and may fill again. The hook ret
 
 | Fault | What the hook does | Result |
 | --- | --- | --- |
-| DPU restart | Drop in-flight tasks and drop slab slots | Clean miss. A new write can complete. Old slot ids are not readable |
-| GPU reset | Hide every slot and drop in-flight tasks. Client completion is unknown, so bytes stay unreadable | Clean miss. New writes require remaining slab capacity |
+| DPU restart | Explicitly fence simulated tasks and drop slab slots; keep task/slot ids monotonic | Clean miss. Old ids are not reusable. A lost control-plane authority still requires `restore_control` |
+| GPU reset | Hide every slot and quarantine in-flight tasks. Completion is unknown, so credits and bytes stay charged | Clean miss. New writes require remaining slab and queue capacity |
 | NIC flap | Same hide. An in-flight transfer is not a hit | Clean miss. Hidden bytes can exhaust the slab |
 | Storage loss | Hide slots. Hidden bytes are not a durability replica and are not returned | Clean miss, then recompute |
-| NVMe timeout | Drop one in-flight task. Do not expose it | Clean miss. Later submits still run |
+| NVMe timeout | Quarantine all pending tasks because the fault carries no task id; preserve healthy committed slots | No incomplete payload is exposed. Queue/byte credits remain charged until explicit drain |
 | Control-plane loss | Hide slots and refuse new submits with `Cancelled` | No read while membership is unknown. `restore_control` permits admission if capacity remains. Old slots stay hidden and charged |
 | RustFS slow | Do not wait and do not call the object store | `RefillOutcome::Missing` |
 | RustFS unavailable | Same as slow | `RefillOutcome::Missing` |
@@ -19,4 +19,8 @@ Lease expiry is still not proof that a copy stopped. The simulated slab does not
 
 This matrix is a CPU contract. It is not a fault campaign on BlueField, GPU, NIC, or RustFS hardware.
 
-A full hidden slab has no drain/reclaim API yet. In this CPU simulation, an explicit DPU restart clears it. Do not translate that into permission to free real DMA buffers: hardware integration needs verified drain and device fencing. Pending write bytes and committed slab bytes share the configured byte cap.
+`quarantine` retains a task whose completion is unknown. `attest_drained` releases only a quarantined task after the trusted queue owner confirms drain; a late `complete` or `fail` cannot publish or free it. `invalidate` and `reclaim_invalidated` are tenant-scoped. Active or quarantined readers prevent slot reclaim. `fail` describes a confirmed failed completion, not an unknown timeout.
+
+Pending writes reserve slab bytes and slot ids at admission. Task and slot metadata each have a hard ceiling of 4096. Pending/quarantined writes and committed/hidden slots share the configured byte cap. Returned payload vectors are caller-owned and are not a complete process-RSS bound.
+
+These explicit CPU drain/reclaim operations and restart fences are not permission to free real DMA buffers. Hardware integration still needs verified transport quiescence and device fencing. Other faults and DPU restart do not silently restore lost control authority.

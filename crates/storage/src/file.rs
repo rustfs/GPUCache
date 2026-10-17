@@ -72,7 +72,11 @@ impl FileStore {
         let manifest_existed = root.join("MANIFEST").is_file();
         let previous_epoch = read_manifest(&root)?.unwrap_or(1);
         let epoch = if manifest_existed {
-            previous_epoch.saturating_add(1).max(1)
+            previous_epoch
+                .checked_add(1)
+                .ok_or(CacheError::FencingRejected {
+                    reason: "epoch exhausted",
+                })?
         } else {
             1
         };

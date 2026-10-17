@@ -5,3 +5,5 @@
 /tmp
 .cargo/registry
 .cargo/git
+/artifacts/
+**/__pycache__/

@@ -53,6 +53,9 @@ pub struct PoolStats {
     pub backing_reused: u64,
     pub epoch: u64,
     pub held_bytes: u64,
+    pub fence_count: u64,
+    pub drained_slots: u64,
+    pub reclaimed_slots: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +83,9 @@ pub struct RegisteredPool {
     reused_registrations: u64,
     backing_reused: u64,
     epoch: u64,
+    fence_count: u64,
+    drained_slots: u64,
+    reclaimed_slots: u64,
 }
 
 impl RegisteredPool {
@@ -113,6 +119,9 @@ impl RegisteredPool {
             reused_registrations: 0,
             backing_reused: 0,
             epoch: 1,
+            fence_count: 0,
+            drained_slots: 0,
+            reclaimed_slots: 0,
         })
     }
 
@@ -139,6 +148,9 @@ impl RegisteredPool {
             backing_reused: self.backing_reused,
             epoch: self.epoch,
             held_bytes: (self.regions.len() * self.slot_bytes) as u64,
+            fence_count: self.fence_count,
+            drained_slots: self.drained_slots,
+            reclaimed_slots: self.reclaimed_slots,
         }
     }
 
@@ -305,6 +317,7 @@ impl RegisteredPool {
         }
         region.id = None;
         region.state = RegionState::Unbound;
+        self.drained_slots = self.drained_slots.saturating_add(1);
         Ok(())
     }
 
@@ -315,6 +328,7 @@ impl RegisteredPool {
             kind: QuotaKind::Registrations,
         })?;
         self.epoch = next;
+        self.fence_count = self.fence_count.saturating_add(1);
         for region in &mut self.regions {
             if matches!(
                 region.state,
@@ -336,6 +350,7 @@ impl RegisteredPool {
                 freed += 1;
             }
         }
+        self.reclaimed_slots = self.reclaimed_slots.saturating_add(freed as u64);
         Ok(freed)
     }
 
@@ -514,5 +529,25 @@ mod tests {
         pool.complete_batch(&batch, SimCompletion::Completed)
             .unwrap();
         assert_eq!(pool.stats().idle_registered, 1);
+    }
+
+    #[test]
+    fn cancellation_storm_requires_drain_and_reports_fence_reclaim_counts() {
+        let mut pool = RegisteredPool::new(2, 8).unwrap();
+        for _ in 0..1000 {
+            let batch = pool.checkout_batch(2).unwrap();
+            pool.complete_batch(&batch, SimCompletion::Unknown).unwrap();
+            assert!(pool.checkout_batch(1).is_err());
+            pool.on_lease_expiry(batch.slots()[0]).unwrap();
+            assert_eq!(pool.stats().quarantined, 2);
+            pool.attest_drain(batch.slots()[0]).unwrap();
+            pool.fence_epoch().unwrap();
+            assert_eq!(pool.reclaim_fenced().unwrap(), 1);
+            assert_eq!(pool.stats().held_bytes, 16);
+        }
+        assert_eq!(pool.stats().fence_count, 1000);
+        assert_eq!(pool.stats().drained_slots, 1000);
+        assert_eq!(pool.stats().reclaimed_slots, 1000);
+        assert_eq!(pool.stats().quarantined, 0);
     }
 }

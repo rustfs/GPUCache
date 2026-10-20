@@ -20,13 +20,16 @@ mod plane;
 mod pool;
 mod rate;
 mod registered;
+mod routing;
 mod server;
 mod shard_demo;
 mod stage;
 
-pub use client::TcpClient;
+pub use client::{ClientIoStats, TcpClient};
 pub use demo::{run_share_demo, ShareReport};
-pub use directory::{Admit, FillNotice, FillRequest, MemberView, ShardDirectory, ShardParams};
+pub use directory::{
+    Admit, DirectoryStats, FillNotice, FillRequest, MemberView, ShardDirectory, ShardParams,
+};
 pub use fault_demo::{run_fault_demo, FaultReport};
 pub use iface::{
     rdma_feature_selected, rdma_probe, submit_preferring_rdma, FallbackReason, HardwarePath,
@@ -35,6 +38,7 @@ pub use iface::{
 pub use plane::{ControlPlane, RebalancePlan, UpgradeStamp};
 pub use rate::RateGate;
 pub use registered::{CheckedBatch, PoolStats, RegisteredPool, SimCompletion, SlotId};
+pub use routing::{ClientLimits, ClientStats, ShardEndpoint, ShardSession, ShardedClient};
 pub use server::{serve, ServerConfig, ServerHandle};
 pub use shard_demo::{run_shard_demo, ShardReport};
 pub use stage::stage_through_tcp;

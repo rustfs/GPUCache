@@ -46,6 +46,16 @@ The hot TCP service does not depend on `gpucache-cold`. RustFS is not on the pre
 
 `drain_report` visits at most the queue length captured at call start, bounded further by `max_jobs`; a requeued task cannot be attempted repeatedly in that call. The report preserves counts and the first job error. The compatible `drain` call returns that first error after the round, even if other jobs completed. Pending and failed jobs together cannot exceed the configured limits or the 4096-job hard ceiling. A full failed queue causes backpressure until the operator retrieves its jobs.
 
+Actual backend timeout, unavailability, missing-object and backpressure errors return
+`Missing` at HEAD, manifest GET and payload GET. Corruption and authorization stay
+explicit errors, and no failure causes inline retries or store mutation. Backend
+implementations must enforce deadlines; the synchronous refill API cannot stop a
+backend call that never returns. See [ADR 0012](adr/0012-cold-failure-contract.md)
+for the error labels, retention behavior, and explicit cleanup policy. ColdKeys
+caps tenant metadata at 1024 and generation history at 4096; ColdOps caps records
+and the deduplicated reclaim queue at 4096. Local constructors can lower these
+ceilings. Failed reclaim and retired key history retain their metadata credits.
+
 Retries use the original content-addressed keys. A failed publication may leave an object without a manifest. Retain its keys for explicit later cleanup after ownership and reference checks. The sink implements neither a reference-safe orphan collector nor a crash-persistent orphan inventory, and does not infer safe deletion from a PUT failure or a HEAD result. It cannot provide a cross-object storage transaction.
 
 Callers migrate to `refill_generation(..., expected)` or `refill_matching(..., expected)` and pass that same identity through `refill_degraded` or `refill_for_tenant`. Old v1/v2 entries require recompute and repack; they are not converted by changing a header. The expected identity comes from the upstream authenticated and authorized request. The cold crate does not establish that identity, authorize arbitrary store keys, or verify the producer's model computation.

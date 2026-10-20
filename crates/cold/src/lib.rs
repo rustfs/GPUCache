@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod demo;
+mod failure;
 mod http;
 mod mock;
 mod ops;
@@ -24,6 +25,7 @@ pub use mock::MockObjectStore;
 pub use ops::{
     enqueue_backfill, refill_degraded, refill_for_tenant, verify_deleted, BackfillLimit,
     ColdAvailability, ColdKeys, ColdOps, ObjectRecord, ReclaimStep, Retention,
+    MAX_COLD_KEY_HISTORY, MAX_COLD_RECORDS, MAX_COLD_TENANTS,
 };
 pub use pack::{
     contract_smoke, manifest_version, pack_blocks, read_manifest, Manifest, ObjectMeta,

@@ -173,7 +173,7 @@ impl AsyncSink {
                     if report.first_error.is_none() {
                         report.first_error = Some(error.clone());
                     }
-                    if retryable(&error) && pending.attempts < MAX_WRITE_ATTEMPTS {
+                    if crate::failure::transient(&error) && pending.attempts < MAX_WRITE_ATTEMPTS {
                         self.queue.push_back(pending);
                         report.requeued += 1;
                     } else {
@@ -223,13 +223,6 @@ impl AsyncSink {
         self.failed_bytes = 0;
         self.cancelled = true;
     }
-}
-
-fn retryable(error: &CacheError) -> bool {
-    matches!(
-        error,
-        CacheError::TimedOut | CacheError::Storage { .. } | CacheError::QuotaExceeded { .. }
-    )
 }
 
 #[cfg(test)]

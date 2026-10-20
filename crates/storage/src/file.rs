@@ -103,6 +103,12 @@ impl FileStore {
         self.inner.epoch()
     }
 
+    /// Configured bearer-fingerprint policies for compiling a transport ACL.
+    /// The returned credentials must never be logged or sent to a peer.
+    pub fn tenant_policies(&self) -> Vec<TenantPolicy> {
+        self.inner.tenant_policies()
+    }
+
     pub fn limits(&self) -> ResourceLimits {
         self.inner.limits()
     }

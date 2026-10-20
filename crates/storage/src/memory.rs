@@ -143,6 +143,8 @@ pub struct StoreStats {
     pub quarantined: u32,
     pub committed: u32,
     pub idempotency_entries: u32,
+    /// Active and stuck pins both retain admission credit until explicit drain.
+    pub reader_pins: u32,
 }
 
 impl MemoryStore {
@@ -183,6 +185,10 @@ impl MemoryStore {
         self.epoch
     }
 
+    pub(crate) fn tenant_policies(&self) -> Vec<TenantPolicy> {
+        self.policies.values().cloned().collect()
+    }
+
     pub fn stats(&self) -> StoreStats {
         let mut quarantined = 0;
         let mut committed = 0;
@@ -200,6 +206,7 @@ impl MemoryStore {
             quarantined,
             committed,
             idempotency_entries: u32::try_from(self.idem.len()).unwrap_or(u32::MAX),
+            reader_pins: self.reader_pin_count(),
         }
     }
 
@@ -250,8 +257,8 @@ impl MemoryStore {
         now_ms: u64,
         request: ReclaimRequest,
     ) -> Result<ReleaseOutcome, CacheError> {
-        self.poll(now_ms);
         self.authorize(auth, None)?;
+        self.poll(now_ms);
         let ReclaimRequest {
             request_id,
             epoch,
@@ -372,9 +379,13 @@ impl MemoryStore {
             &request_ids(items.iter().map(|i| i.header.request_id)),
         )?;
         let mut out = Vec::with_capacity(items.len());
+        let mut remaining = self.limits.max_object_bytes;
         for item in items {
             let id = item.header.request_id;
-            let result = self.get_one(auth, now_ms, &item);
+            let result = self.get_one(auth, now_ms, &item, remaining);
+            if let Ok(hit) = &result {
+                remaining -= hit.length;
+            }
             out.push(ItemResult {
                 request_id: id,
                 body: result,
@@ -1060,6 +1071,7 @@ impl MemoryStore {
         auth: &AuthContext,
         now_ms: u64,
         item: &GetItem,
+        remaining_reply_bytes: u64,
     ) -> Result<GetHit, CacheError> {
         self.check_header(&item.header, now_ms)?;
         self.authorize(auth, Some(&item.identity))?;
@@ -1068,8 +1080,16 @@ impl MemoryStore {
                 reason: "pin ttl required",
             });
         }
+        // Independent reader ceiling uses the existing request limit, so no
+        // public wire/config schema changes are needed. Check before cloning
+        // a payload. Expiry and cancellation do not release unknown pins.
+        if self.reader_pin_count() >= self.limits.max_in_flight_requests {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests,
+            });
+        }
         let generation = item.generation;
-        let (visible, fail, state, region_id, payload, checksum, length, same_identity) = {
+        let (visible, fail, state, region_id, checksum, length, same_identity) = {
             let slot = self
                 .slots
                 .get(&generation)
@@ -1080,7 +1100,6 @@ impl MemoryStore {
                 slot.fail,
                 slot.life.state,
                 slot.region_id,
-                slot.bytes.clone().unwrap_or_default(),
                 slot.checksum,
                 slot.length,
                 slot.identity == item.identity,
@@ -1095,6 +1114,16 @@ impl MemoryStore {
         let region_id = region_id.ok_or(CacheError::Malformed {
             reason: "missing region",
         })?;
+        if length > remaining_reply_bytes {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightBytes,
+            });
+        }
+        let payload = self
+            .slots
+            .get(&generation)
+            .and_then(|slot| slot.bytes.clone())
+            .unwrap_or_default();
         if payload.len() as u64 != length || verify_checksum(&payload, checksum).is_err() {
             self.apply_event(generation, Event::CorruptHold, Some(FailKind::Corrupt))?;
             return Err(CacheError::ChecksumMismatch);
@@ -1120,6 +1149,13 @@ impl MemoryStore {
             lease_deadline_ms,
             payload,
         })
+    }
+
+    fn reader_pin_count(&self) -> u32 {
+        self.slots
+            .values()
+            .map(|slot| slot.pins.len() as u32)
+            .fold(0, u32::saturating_add)
     }
 
     fn release_one(

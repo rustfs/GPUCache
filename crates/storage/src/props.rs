@@ -164,6 +164,9 @@ fn random_operations_never_return_uncommitted_or_foreign_bytes() {
             next_id += 1;
             match &got.items[0].body {
                 Ok(hit) => assert_eq!(hit.payload, *payload),
+                Err(CacheError::QuotaExceeded {
+                    kind: gpucache_core_types::QuotaKind::InFlightRequests,
+                }) => assert_eq!(store.stats().reader_pins, limits.max_in_flight_requests),
                 Err(err) => panic!("get of committed block failed: {err}"),
             }
         }
@@ -171,6 +174,7 @@ fn random_operations_never_return_uncommitted_or_foreign_bytes() {
         assert!(stats.retained_bytes <= limits.max_retained_bytes);
         assert!(stats.registrations <= limits.max_registrations);
         assert!(stats.in_flight_requests <= limits.max_in_flight_requests);
+        assert!(stats.reader_pins <= limits.max_in_flight_requests);
     }
     let _ = CacheError::TimedOut;
 }

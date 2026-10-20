@@ -107,4 +107,29 @@ proptest! {
         let _ = decode_hello(&bytes);
         let _ = decode_hello_ack(&bytes);
     }
+
+    #[test]
+    fn valid_exports_reject_every_generated_truncation_and_payload_bit_flip(
+        payload in prop::collection::vec(any::<u8>(), 1..1024),
+        position in any::<usize>(),
+        bit in 0u8..8,
+    ) {
+        let block = CommittedExport {
+            identity: synthetic_identity(1, 1),
+            source_generation: 1,
+            checksum: content_checksum(&payload),
+            payload: payload.clone(),
+        };
+        let frame = encode_export(&block).unwrap();
+        prop_assert_eq!(decode_export(&frame).unwrap(), block);
+        let cut = position % frame.len();
+        prop_assert!(decode_export(&frame[..cut]).is_err());
+        let mut changed = frame.clone();
+        let offset = changed.len() - payload.len() + position % payload.len();
+        changed[offset] ^= 1 << bit;
+        prop_assert!(decode_export(&changed).is_err());
+        let mut trailing = frame;
+        trailing.push(0);
+        prop_assert!(decode_export(&trailing).is_err());
+    }
 }

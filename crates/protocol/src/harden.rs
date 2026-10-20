@@ -63,6 +63,7 @@ impl SecurityLog {
     }
 }
 
+#[derive(Clone)]
 struct AclEntry {
     tenant: TenantId,
     trust: TrustDomain,
@@ -70,9 +71,19 @@ struct AclEntry {
     write: bool,
 }
 
+#[derive(Clone)]
 pub struct Acl {
     entries: Vec<AclEntry>,
     max: usize,
+}
+
+impl std::fmt::Debug for Acl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Acl")
+            .field("entries", &self.entries.len())
+            .field("capacity", &self.max)
+            .finish()
+    }
 }
 
 impl Acl {
@@ -434,6 +445,25 @@ pub fn authorize_request(
 mod tests {
     use super::*;
     use gpucache_core_types::TenantId;
+
+    #[test]
+    fn cloned_acl_keeps_authority_without_exposing_fingerprints_in_debug() {
+        let ctx = AuthContext::new(
+            TenantId::new(b"tenant".to_vec()).unwrap(),
+            TrustDomain::new(b"trust".to_vec()).unwrap(),
+            [173; 32],
+        )
+        .unwrap();
+        let mut acl = Acl::new(1).unwrap();
+        acl.grant(ctx.clone(), false).unwrap();
+        let copy = acl.clone();
+        assert_eq!(copy.check(&ctx, false), Ok(()));
+        assert_eq!(copy.check(&ctx, true), Err(CacheError::Unauthorized));
+        let debug = format!("{copy:?}");
+        assert!(debug.contains("entries: 1"));
+        assert!(!debug.contains("173"));
+        assert!(!debug.contains("tenant"));
+    }
 
     fn ctx(tenant: &[u8], fingerprint: u8) -> AuthContext {
         AuthContext::new(

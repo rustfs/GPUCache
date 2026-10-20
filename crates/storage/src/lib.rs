@@ -8,11 +8,13 @@
 
 #![forbid(unsafe_code)]
 
+mod engine_spike;
 mod file;
 mod memory;
 mod synthetic;
 mod transfer;
 
+pub use engine_spike::{EngineBlockContract, ENGINE_SPIKE_ABI_VERSION};
 pub use file::{FileStore, PersistFault};
 pub use memory::{MemoryStore, ReclaimRequest, StoreStats};
 pub use synthetic::{decode_synthetic_kv, deterministic_recompute, encode_synthetic_kv};

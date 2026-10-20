@@ -69,6 +69,9 @@ def cpu_gates(offline=False):
                                                 "--all-features") + locked),
     ]
     demos = [
+        ("engine-spike", "gpucache-storage", "engine-spike",
+         ("status=FAKE_BLOCK_CONTRACT_OK", "real_export_import=NOT_RUN_HARDWARE",
+          "gpu_model_run=NOT_RUN_BUDGET", "performance=NOT_A_PERFORMANCE_RESULT")),
         ("share-demo", "gpucache-transport", "share-demo", ("status=REUSE_OK",)),
         ("fault-demo", "gpucache-transport", "fault-demo", ("status=FALLBACK_OK",)),
         ("shard-demo", "gpucache-transport", "shard-demo",
@@ -84,6 +87,10 @@ def cpu_gates(offline=False):
     for name, package, binary, expected in demos:
         gates.append(Gate(name, cargo + ("run", "-p", package, "--bin", binary, "--quiet")
                           + locked, expected))
+    gates.append(Gate("cpu-simulation-pair",
+                      (sys.executable, "scripts/ci/cpu_simulation_pair.py"),
+                      ("status=CPU_SIMULATION_PAIR_OK", "hardware=NOT_RUN_HARDWARE",
+                       "performance=NOT_A_PERFORMANCE_RESULT", "tco=TCO_UNKNOWN")))
     return gates
 
 

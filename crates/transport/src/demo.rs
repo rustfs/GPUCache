@@ -24,6 +24,7 @@ use crate::server::{serve, ServerConfig};
 /// same chain is an incompatible miss: this demo does not slice inside a block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareReport {
+    pub payload_sha256: String,
     pub exact_hit: &'static str,
     pub unknown_miss: &'static str,
     pub partial_prefix: &'static str,
@@ -37,6 +38,8 @@ pub struct ShareReport {
 impl std::fmt::Display for ShareReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "status=REUSE_OK")?;
+        writeln!(f, "payload_sha256={}", self.payload_sha256)?;
+        writeln!(f, "performance=NOT_A_PERFORMANCE_RESULT")?;
         writeln!(f, "exact_hit={}", self.exact_hit)?;
         writeln!(f, "unknown_miss={}", self.unknown_miss)?;
         writeln!(
@@ -196,6 +199,11 @@ fn run_in(path: &std::path::Path) -> Result<ShareReport, CacheError> {
         });
     }
     Ok(ShareReport {
+        payload_sha256: content_checksum(&got)
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
         exact_hit: "PASS",
         unknown_miss: "PASS",
         partial_prefix: "WHOLE_BLOCK_PREFIX",

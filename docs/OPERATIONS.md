@@ -135,6 +135,42 @@ See [../COMPATIBILITY.md](../COMPATIBILITY.md) and [V3_DPU_TARGETS.md](V3_DPU_TA
 
 No NVMe format, no DPU mode change, no firmware, no IOMMU or BIOS change, no production network change, no hardware purchase. Those need a separate authorization. There is no website deploy and no crates.io publish in this milestone. G4 live calls stay env-gated.
 
+## CPU fault and rolling-upgrade runbook
+
+All device faults below are CPU simulations. Stop admission before changing an
+owner; publish routing only after every endpoint in the new snapshot has fenced successfully.
+Never convert lease expiry into a drain attestation.
+
+| Event | Operator sequence | CPU regression |
+| --- | --- | --- |
+| Process restart | Drop the server handle and wait for connection workers to exit; reopen the file store, which advances its persisted epoch; publish a newer route snapshot; discard old generation handles and recompute misses | `cargo test -p gpucache-transport --test sharded_tcp`; `cargo test -p gpucache-storage --test file_backend` |
+| NIC flap (simulated) | Quarantine unknown completions and preserve credits; resume admission only with healthy control; explicit CPU drain/fence is required before reuse | `cargo test -p gpucache-dpu --lib`; inspect `HostSimulation::stats` and `RegisteredPool::stats` |
+| Disk full | Refuse the failed fill, recompute, free space under the ordinary-file data directory, and retry with a fresh request after recovery; never expose a partially committed block | `cargo test -p gpucache-storage --test fault_matrix` |
+| Cold sink storm | Inspect `drain_report`; healthy pending jobs advance while failed jobs retain shared credit. Diagnose permanent failures, then explicitly `take_failed` or re-enqueue under policy; do not delete on ambiguous PUT | `cargo test -p gpucache-cold`; inspect pending/failed counts and retained bytes |
+| Epoch stuck/exhausted | Leave the old published membership and notices intact; stop admission and reconcile operator state. Do not reset a live epoch or force-release quarantined regions | `cargo test -p gpucache-transport --lib`; fence overflow/batch atomicity tests |
+
+For rebalance, externally stop new traffic, record old epochs/in-flight Put IDs,
+apply the complete bounded membership snapshot while ControlPlane is Serving,
+and fence the actual stores. The control-plane object does not fence a remote
+TCP process. Publish routes only after **every** endpoint in the replacement
+snapshot has an epoch above the previous snapshot's maximum. Old sessions and
+late replies must fail; test a new Lookup/Get/Put cycle before resuming traffic.
+
+For software upgrade, use `begin_upgrade` to stop fills, drain or fail old work,
+then `finish_upgrade` to advance the software generation and fence. Do not call
+`apply_membership` while Draining: it deliberately refuses. A failed preflight
+leaves membership, generation, notices and credits unchanged. Before finish,
+rollback may resume without a fence; after finish it requires another fence.
+There are no hot durability replicas to rebuild or migrate. Hardware/firmware
+rolling upgrades remain outside this checklist.
+
+Byte counters describe completed application envelopes, not NIC traffic:
+`ClientIoStats` excludes TCP/IP headers, retransmissions and incomplete frames.
+`TransferReceipt::staged_bytes` is a host copy count. Reader pins include
+expired/stuck pins; `max_in_flight_requests` independently caps readers and
+writers. The aggregate payload in a Get batch is capped by `max_object_bytes`.
+Reduce batch size after admission refusal; never bypass identity checks.
+
 ## CPU audit changes (2026-10-15)
 
 LRU recency is advisory. Lookup and Get update it in memory without filesystem writes.

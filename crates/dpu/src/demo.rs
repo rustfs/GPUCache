@@ -8,22 +8,28 @@
 
 use core::fmt;
 
-use gpucache_core_types::CacheError;
+use gpucache_core_types::{content_checksum, CacheError};
 
 use crate::ablation::{Ablation, Knob};
 use crate::queue::{
     dpu_feature_selected, open_doca, open_nvme_device, open_spdk, ArmAgent, StorageQueue,
 };
 use crate::target::planned_targets;
+use crate::{Fault, HostSimulation, SimulationMessage, SimulationReply};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DpuReport {
     pub feature: &'static str,
+    pub payload_sha256: String,
 }
 
 impl fmt::Display for DpuReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "status=DPU_CONTRACT_OK")?;
+        writeln!(f, "payload_sha256={}", self.payload_sha256)?;
+        writeln!(f, "message_path=HOST_SIMULATION")?;
+        writeln!(f, "fault_path=QUARANTINE_DRAIN_PASS")?;
+        writeln!(f, "performance=NOT_A_PERFORMANCE_RESULT")?;
         writeln!(f, "arm_process=STARTED")?;
         writeln!(f, "offload_active=false")?;
         writeln!(f, "offload=STORAGE_QUEUE")?;
@@ -93,7 +99,59 @@ pub fn run_dpu_demo() -> Result<DpuReport, CacheError> {
     } else {
         "UNSELECTED"
     };
-    Ok(DpuReport { feature })
+    // Exercise typed host messages and a lost-completion failure path too.
+    let mut host = HostSimulation::new(64, 2)?;
+    let payload = b"shared-kv-block";
+    let SimulationReply::Submitted(write) = host.handle(SimulationMessage::Write {
+        tenant: b"tenant-a",
+        payload,
+    })?
+    else {
+        return Err(CacheError::Incompatible);
+    };
+    let SimulationReply::Completed(done) = host.handle(SimulationMessage::Complete(write))? else {
+        return Err(CacheError::Incompatible);
+    };
+    let slot = done.slot.ok_or(CacheError::UnknownGeneration)?;
+    let SimulationReply::Submitted(read) = host.handle(SimulationMessage::Read {
+        tenant: b"tenant-a",
+        slot,
+    })?
+    else {
+        return Err(CacheError::Incompatible);
+    };
+    let SimulationReply::Completed(got) = host.handle(SimulationMessage::Complete(read))? else {
+        return Err(CacheError::Incompatible);
+    };
+    if got.payload.as_deref() != Some(payload.as_slice()) {
+        return Err(CacheError::ChecksumMismatch);
+    }
+    let SimulationReply::Submitted(pending) = host.handle(SimulationMessage::Write {
+        tenant: b"tenant-a",
+        payload,
+    })?
+    else {
+        return Err(CacheError::Incompatible);
+    };
+    host.handle(SimulationMessage::Fault(Fault::NicFlap))?;
+    if host.handle(SimulationMessage::Complete(pending)).is_ok()
+        || host.stats().quarantined_tasks != 1
+    {
+        return Err(CacheError::Incompatible);
+    }
+    host.handle(SimulationMessage::Drain(pending))?;
+    if host.stats().drain_attestations != 1 || host.stats().quarantined_tasks != 0 {
+        return Err(CacheError::Incompatible);
+    }
+    let payload_sha256 = content_checksum(payload)
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(DpuReport {
+        feature,
+        payload_sha256,
+    })
 }
 
 #[cfg(test)]

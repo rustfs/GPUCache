@@ -19,5 +19,9 @@ proptest = "=1.4.0"
 name = "kv-block-xfer"
 path = "src/bin/kv_block_xfer.rs"
 
+[[bin]]
+name = "engine-spike"
+path = "src/bin/engine_spike.rs"
+
 [lints]
 workspace = true

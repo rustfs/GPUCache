@@ -118,7 +118,7 @@ A missing tool, timeout, crashed child, failed assertion or invalid invocation r
 3. Verify the identity, tenant, checksum, commit, prefix, timeout/cancel, quarantine and epoch tests passed. The current tests use synthetic bytes.
 4. Check that demos retain their scope labels: `registration=SIMULATED`, `dma_posted=false` where reported, `offload_active=false`, `doca=NOT_LINKED` and `NOT_RUN_HARDWARE`. A changed label requires implementation evidence, not a report rewrite.
 5. Inspect failures in the raw logs and reproduce the individual command in a fresh temporary environment. Preserve the failing seed and case if a property/fuzz test prints them. A recorded runner seed alone does not guarantee that a particular property-test library consumed it or can replay every failure.
-6. Report limitations with the artifact. Current V3 security hooks are not wired into the TCP service; current limits do not bound every reader pin, reply allocation or metadata structure. Hidden simulated slab bytes stay charged until explicit CPU drain/invalidation/reclaim rules permit release and can cause admission denial. Those APIs are not hardware drain evidence. A green CPU report does not remove these limitations.
+6. Report limitations with the artifact. TCP now enforces ACL and rate admission. Reader pins, aggregate Get payloads, routed sockets/retry records and cold metadata have ceilings. Replay nonces, mTLS and automatic rotation are still outside GCK1. Hidden simulated slab bytes stay charged until explicit CPU drain/invalidation/reclaim rules permit release and can cause admission denial. Those APIs are not hardware drain evidence. A green CPU report does not remove these limitations.
 
 ## Reruns and failure handling
 
@@ -136,3 +136,7 @@ The following is **PROPOSED / NOT IMPLEMENTED**. A later native runner may suppo
 - BF3: storage-side topology, BFB/OS/DOCA/firmware, actual queue submit/complete and the paired NIC-RDMA baseline. Arm process start alone is insufficient.
 
 These profiles remain unavailable until implemented and exercised. Physical fleet qualification, a day-long device soak, PB-scale and 10,000-GPU reliability cannot be derived from this VM runner.
+
+## CPU completion additions
+
+`engine-spike` checks fake-block ABI validation and keeps real engine work `NOT_RUN_HARDWARE` / `NOT_RUN_BUDGET`. `cpu-simulation-pair` compares checked synthetic payload digests from localhost TCP and host simulation, includes fault checks, and requires `NOT_A_PERFORMANCE_RESULT`. Neither gate contains product performance samples. See [CPU_COMPLETION.md](CPU_COMPLETION.md) for the gap map and remaining boundaries.

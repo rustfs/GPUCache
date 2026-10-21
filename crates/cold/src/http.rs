@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gpucache_core_types::{content_checksum, CacheError};
+use gpucache_core_types::{content_checksum, CacheError, QuotaKind};
 
 use crate::pack::{contract_smoke, ObjectMeta, ObjectStore};
 use crate::sigv4::{authorization, format_amz_time, hex, sha256, SignInput};
@@ -154,11 +154,7 @@ impl ObjectStore for HttpStore {
     fn put(&mut self, key: &str, body: &[u8]) -> Result<(), CacheError> {
         let key = self.full_key(key)?;
         let status = request(self, "PUT", &key, body, None, false)?;
-        if !(200..300).contains(&status.code) {
-            return Err(CacheError::Storage {
-                reason: "object store",
-            });
-        }
+        check_status(status.code)?;
         Ok(())
     }
 
@@ -170,17 +166,9 @@ impl ObjectStore for HttpStore {
                 reason: "object missing",
             });
         }
-        if !(200..300).contains(&status.code) {
-            return Err(CacheError::Storage {
-                reason: "object store",
-            });
-        }
+        check_status(status.code)?;
         let fetched = request(self, "GET", &key, b"", None, true)?;
-        if !(200..300).contains(&fetched.code) {
-            return Err(CacheError::Storage {
-                reason: "object store",
-            });
-        }
+        check_status(fetched.code)?;
         if let Some(len) = status.content_length {
             if len != fetched.body.len() as u64 {
                 return Err(CacheError::LengthMismatch {
@@ -200,11 +188,7 @@ impl ObjectStore for HttpStore {
         let end = offset.saturating_add(length).saturating_sub(1);
         let header = format!("bytes={offset}-{end}");
         let status = request(self, "GET", &key, b"", Some(&header), true)?;
-        if !(200..300).contains(&status.code) {
-            return Err(CacheError::Storage {
-                reason: "object store",
-            });
-        }
+        check_status(status.code)?;
         if status.body.len() as u64 != length {
             return Err(CacheError::LengthMismatch {
                 expected: length,
@@ -220,9 +204,28 @@ impl ObjectStore for HttpStore {
         if status.code == 404 || (200..300).contains(&status.code) {
             return Ok(());
         }
-        Err(CacheError::Storage {
-            reason: "object store",
-        })
+        check_status(status.code)
+    }
+}
+
+/// Preserve permanent authentication/request failures for sink classification.
+fn check_status(code: u16) -> Result<(), CacheError> {
+    match code {
+        200..=299 => Ok(()),
+        401 | 403 => Err(CacheError::Unauthorized),
+        404 => Err(CacheError::Storage {
+            reason: "object missing",
+        }),
+        408 => Err(CacheError::TimedOut),
+        429 => Err(CacheError::QuotaExceeded {
+            kind: QuotaKind::RateLimit,
+        }),
+        500..=599 => Err(CacheError::Storage {
+            reason: "object unavailable",
+        }),
+        _ => Err(CacheError::Malformed {
+            reason: "object response",
+        }),
     }
 }
 
@@ -324,7 +327,7 @@ fn request(
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
-                break;
+                return Err(CacheError::TimedOut);
             }
             Err(_) => {
                 return Err(CacheError::Storage {
@@ -337,32 +340,52 @@ fn request(
 }
 
 fn parse_response(raw: &[u8], read_body: bool) -> Result<HttpStatus, CacheError> {
-    let text = std::str::from_utf8(raw).map_err(|_| CacheError::Storage {
-        reason: "object store",
-    })?;
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
-    let mut lines = head.lines();
-    let status = lines.next().ok_or(CacheError::Storage {
-        reason: "object store",
-    })?;
-    let code = status
-        .split_whitespace()
-        .nth(1)
+    let malformed = || CacheError::Malformed {
+        reason: "object response",
+    };
+    // KV packs contain arbitrary bytes; only the HTTP header is UTF-8 text.
+    let boundary = raw
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .ok_or_else(malformed)?;
+    let text = std::str::from_utf8(&raw[..boundary]).map_err(|_| malformed())?;
+    let mut lines = text.split("\r\n");
+    let status = lines.next().ok_or_else(malformed)?;
+    let mut fields = status.split_whitespace();
+    if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+        return Err(malformed());
+    }
+    let code = fields
+        .next()
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or(CacheError::Storage {
-            reason: "object store",
-        })?;
+        .filter(|code| (100..=599).contains(code))
+        .ok_or_else(malformed)?;
     let mut content_length = None;
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
+        let (name, value) = line.split_once(':').ok_or_else(malformed)?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            // The dependency-free smoke client does not decode chunked bodies.
+            return Err(malformed());
+        }
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.trim().parse::<u64>().ok();
+            if content_length.is_some() {
+                return Err(malformed());
+            }
+            content_length = Some(value.trim().parse::<u64>().map_err(|_| malformed())?);
         }
     }
-    let body = if read_body {
-        body.as_bytes().to_vec()
+    let received = &raw[boundary + 4..];
+    let body = if read_body && (200..300).contains(&code) {
+        // An incomplete response, including a read timeout after headers, must
+        // never yield a truncated success or consume bytes past the declared body.
+        let expected = content_length.ok_or_else(malformed)?;
+        if received.len() as u64 != expected {
+            return Err(CacheError::LengthMismatch {
+                expected,
+                actual: received.len() as u64,
+            });
+        }
+        received.to_vec()
     } else {
         Vec::new()
     };
@@ -419,5 +442,58 @@ mod tests {
                 reason: "no authorized RustFS endpoint",
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn http_status_preserves_permanent_and_transient_backend_failures() {
+        for code in [401, 403] {
+            assert_eq!(check_status(code), Err(CacheError::Unauthorized));
+        }
+        for code in [400, 301, 409, 413, 416] {
+            let error = check_status(code).unwrap_err();
+            assert!(!crate::failure::transient(&error));
+        }
+        for code in [408, 429, 500, 502, 503, 504] {
+            let error = check_status(code).unwrap_err();
+            assert!(crate::failure::transient(&error));
+            assert!(crate::failure::refill_miss(&error));
+        }
+        assert!(crate::failure::refill_miss(&check_status(404).unwrap_err()));
+        assert_eq!(check_status(204), Ok(()));
+        // Error status classification does not require a success payload body.
+        let status = parse_response(b"HTTP/1.1 503 Unavailable\r\n\r\n", true).unwrap();
+        assert_eq!(
+            check_status(status.code),
+            Err(CacheError::Storage {
+                reason: "object unavailable"
+            })
+        );
+    }
+
+    #[test]
+    fn response_parser_preserves_binary_bodies_and_requires_complete_framing() {
+        let mut response = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\n".to_vec();
+        response.extend_from_slice(&[0, 255, 128, 42]);
+        let parsed = parse_response(&response, true).unwrap();
+        assert_eq!(parsed.code, 206);
+        assert_eq!(parsed.body, [0, 255, 128, 42]);
+        for malformed in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nxx",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n\r\nx",
+            b"HTTP/1.1 200 OK\r\nContent-Length: garbage\r\n\r\nx",
+        ] {
+            assert!(parse_response(malformed, true).is_err());
+        }
+        // HEAD describes object length but contains no body.
+        assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 900\r\n\r\n", false).is_ok());
     }
 }

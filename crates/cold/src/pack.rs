@@ -57,6 +57,13 @@ pub struct Pack {
     pub ranges: Vec<PayloadRange>,
 }
 
+/// Trusted backend capability, separate from the authenticated hot path.
+///
+/// Adapters report transient I/O failures as `TimedOut`, `Storage` with reason
+/// "object store" or "object unavailable", or `QuotaExceeded`. Missing reads
+/// use `Storage { reason: "object missing" }`. Authorization, malformed input,
+/// corruption, and other storage labels are permanent write failures. A failed
+/// PUT may already be visible: consumers must not infer permission to DELETE.
 pub trait ObjectStore {
     fn put(&mut self, key: &str, body: &[u8]) -> Result<(), CacheError>;
     fn head(&self, key: &str) -> Result<ObjectMeta, CacheError>;

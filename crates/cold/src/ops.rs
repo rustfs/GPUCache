@@ -6,8 +6,9 @@
 //!
 //! Live RustFS stays outside this module. A slow or unavailable cold tier
 //! returns [`RefillOutcome::Missing`] without reading the store, so the
-//! caller recomputes and is not blocked. Expired objects are deleted only
-//! after the following head shows them gone.
+//! caller recomputes and is not blocked. Explicit retention reclaim is complete
+//! only after a following HEAD shows the object gone. Unknown objects are never
+//! discovered or collected automatically.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -16,6 +17,11 @@ use gpucache_core_types::{CacheError, CacheIdentity, Checksum, QuotaKind};
 use crate::pack::{key_ok, ObjectStore, MANIFEST_VERSION};
 use crate::refill::{refill_generation, refill_matching, RefillBudget, RefillOutcome};
 use crate::sink::{AsyncSink, ColdJob};
+
+/// Hard metadata ceilings, independent of packed payload byte budgets.
+pub const MAX_COLD_TENANTS: usize = 1024;
+pub const MAX_COLD_KEY_HISTORY: usize = 4096;
+pub const MAX_COLD_RECORDS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retention {
@@ -126,6 +132,8 @@ struct ColdKey {
 pub struct ColdKeys {
     items: Vec<ColdKey>,
     next: BTreeMap<Vec<u8>, u64>,
+    max_tenants: usize,
+    max_history: usize,
 }
 
 impl ColdKeys {
@@ -133,7 +141,28 @@ impl ColdKeys {
         Self {
             items: Vec::new(),
             next: BTreeMap::new(),
+            max_tenants: MAX_COLD_TENANTS,
+            max_history: MAX_COLD_KEY_HISTORY,
         }
+    }
+
+    /// Lower local limits for metadata. Retired generations remain charged:
+    /// dropping their history must never make a retired credential valid again.
+    pub fn with_limits(max_tenants: usize, max_history: usize) -> Result<Self, CacheError> {
+        if max_tenants == 0
+            || max_tenants > MAX_COLD_TENANTS
+            || max_history == 0
+            || max_history > MAX_COLD_KEY_HISTORY
+        {
+            return Err(CacheError::Malformed {
+                reason: "cold key limits",
+            });
+        }
+        Ok(Self {
+            max_tenants,
+            max_history,
+            ..Self::new()
+        })
     }
 
     pub fn issue(&mut self, tenant: &[u8]) -> Result<u64, CacheError> {
@@ -141,7 +170,9 @@ impl ColdKeys {
         if self.next.get(tenant).copied().unwrap_or(0) != 0 {
             return Err(CacheError::IdempotencyConflict);
         }
-        Ok(self.insert(tenant, KeyState::Current))
+        let generation = self.prepare_insert(tenant)?;
+        self.insert(tenant, generation);
+        Ok(generation)
     }
 
     pub fn rotate(&mut self, tenant: &[u8]) -> Result<u64, CacheError> {
@@ -153,12 +184,15 @@ impl ColdKeys {
         {
             return Err(CacheError::UnknownGeneration);
         }
+        // Capacity and generation exhaustion must not demote the current key.
+        let generation = self.prepare_insert(tenant)?;
         for item in &mut self.items {
             if item.tenant.as_slice() == tenant && item.state == KeyState::Current {
                 item.state = KeyState::Overlap;
             }
         }
-        Ok(self.insert(tenant, KeyState::Current))
+        self.insert(tenant, generation);
+        Ok(generation)
     }
 
     pub fn retire(&mut self, tenant: &[u8], generation: u64) -> Result<(), CacheError> {
@@ -211,20 +245,31 @@ impl ColdKeys {
         Ok(())
     }
 
-    fn insert(&mut self, tenant: &[u8], state: KeyState) -> u64 {
-        let generation = self
-            .next
+    fn prepare_insert(&self, tenant: &[u8]) -> Result<u64, CacheError> {
+        if self.items.len() >= self.max_history
+            || (!self.next.contains_key(tenant) && self.next.len() >= self.max_tenants)
+        {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests,
+            });
+        }
+        self.next
             .get(tenant)
             .copied()
             .unwrap_or(0)
-            .saturating_add(1);
+            .checked_add(1)
+            .ok_or(CacheError::FencingRejected {
+                reason: "cold key generation exhausted",
+            })
+    }
+
+    fn insert(&mut self, tenant: &[u8], generation: u64) {
         self.next.insert(tenant.to_vec(), generation);
         self.items.push(ColdKey {
             tenant: tenant.to_vec(),
             generation,
-            state,
+            state: KeyState::Current,
         });
-        generation
     }
 }
 
@@ -239,6 +284,7 @@ pub struct ColdOps {
     records: BTreeMap<String, ObjectRecord>,
     reclaim: VecDeque<String>,
     keys: ColdKeys,
+    max_records: usize,
 }
 
 impl ColdOps {
@@ -248,7 +294,22 @@ impl ColdOps {
             records: BTreeMap::new(),
             reclaim: VecDeque::new(),
             keys: ColdKeys::new(),
+            max_records: MAX_COLD_RECORDS,
         }
+    }
+
+    /// Bound tracked objects and, consequently, their deduplicated reclaim queue.
+    /// Failed reclaim keeps its record and its credit until verified completion.
+    pub fn with_capacity(retention: Retention, max_records: usize) -> Result<Self, CacheError> {
+        if max_records == 0 || max_records > MAX_COLD_RECORDS {
+            return Err(CacheError::Malformed {
+                reason: "cold record limits",
+            });
+        }
+        Ok(Self {
+            max_records,
+            ..Self::new(retention)
+        })
     }
 
     pub fn keys(&self) -> &ColdKeys {
@@ -270,6 +331,13 @@ impl ColdOps {
         }
         self.keys
             .allow_write(&record.tenant, record.key_generation)?;
+        if !self.records.contains_key(&record.key) && self.records.len() >= self.max_records {
+            return Err(CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightRequests,
+            });
+        }
+        // A renewed record invalidates an earlier expiration decision.
+        self.reclaim.retain(|key| key != &record.key);
         self.records.insert(record.key.clone(), record);
         Ok(())
     }
@@ -294,36 +362,36 @@ impl ColdOps {
         added
     }
 
+    /// Attempt one explicitly scheduled retention record. Every failure retains
+    /// its record and moves it to the tail, so a bad backend key cannot starve
+    /// healthy keys. A checksum mismatch never authorizes deleting other bytes.
     pub fn reclaim_one(&mut self, store: &mut dyn ObjectStore) -> Result<ReclaimStep, CacheError> {
         let Some(key) = self.reclaim.pop_front() else {
             return Ok(ReclaimStep::Idle);
         };
-        let Some(record) = self.records.get(&key).cloned() else {
+        let Some(record) = self.records.get(&key) else {
             return Ok(ReclaimStep::Idle);
         };
-        match store.head(&key) {
+        let result = match store.head(&key) {
             Err(CacheError::Storage {
                 reason: "object missing",
-            }) => {
+            }) => Ok(()),
+            Err(err) => Err(err),
+            Ok(meta) if meta.checksum != record.checksum => Err(CacheError::ChecksumMismatch),
+            Ok(_) => store
+                .delete(&key)
+                .and_then(|()| verify_deleted(store, &key)),
+        };
+        match result {
+            Ok(()) => {
                 self.records.remove(&key);
-                return Ok(ReclaimStep::Verified);
+                Ok(ReclaimStep::Verified)
             }
-            Err(err) => return Err(err),
-            Ok(meta) if meta.checksum != record.checksum => {
-                store.delete(&key)?;
-                verify_deleted(store, &key)?;
-                self.records.remove(&key);
-                return Err(CacheError::ChecksumMismatch);
+            Err(err) => {
+                self.reclaim.push_back(key);
+                Err(err)
             }
-            Ok(_) => {}
         }
-        store.delete(&key)?;
-        if let Err(err) = verify_deleted(store, &key) {
-            self.reclaim.push_front(key);
-            return Err(err);
-        }
-        self.records.remove(&key);
-        Ok(ReclaimStep::Verified)
     }
 }
 
@@ -553,3 +621,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "reclaim_tests.rs"]
+mod reclaim_tests;

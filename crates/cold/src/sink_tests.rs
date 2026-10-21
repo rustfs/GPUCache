@@ -381,3 +381,93 @@ fn metadata_and_payload_admissions_are_bounded() {
     ));
     assert_eq!(sink.retained_bytes(), 0);
 }
+
+#[test]
+fn permanent_storage_corruption_is_not_retried_but_temporary_errors_are() {
+    let permanent = [
+        CacheError::Unauthorized,
+        CacheError::Malformed { reason: "cold key" },
+        CacheError::ChecksumMismatch,
+        CacheError::Storage {
+            reason: "store corrupt",
+        },
+        CacheError::Storage {
+            reason: "object missing",
+        },
+        CacheError::Storage {
+            reason: "unknown backend error",
+        },
+    ];
+    let transient = [
+        CacheError::TimedOut,
+        CacheError::Storage {
+            reason: "object store",
+        },
+        CacheError::Storage {
+            reason: "object unavailable",
+        },
+        CacheError::QuotaExceeded {
+            kind: QuotaKind::InFlightBytes,
+        },
+    ];
+    for (errors, should_retry) in [(&permanent[..], false), (&transient[..], true)] {
+        for error in errors {
+            let job = ColdJob::from_pack(&pack("classification", 1));
+            let mut sink = AsyncSink::new(1, job.byte_weight()).unwrap();
+            let mut store = FaultStore::default();
+            store.fail(&job.manifest_key, Fault::Before(error.clone()), 1);
+            sink.enqueue(job.clone()).unwrap();
+            let report = sink.drain_report(&mut store, usize::MAX).unwrap();
+            assert_eq!(report.attempted, 1);
+            assert_eq!(report.requeued, u32::from(should_retry));
+            assert_eq!(report.failed, u32::from(!should_retry));
+            assert_eq!(sink.retained_bytes(), job.byte_weight());
+            assert_eq!(store.deletes, 0);
+            assert!(store.head(&job.object_key).is_ok());
+        }
+    }
+}
+
+#[test]
+fn failed_job_storm_never_releases_credit_or_collects_orphans_automatically() {
+    use crate::{ColdOps, ReclaimStep, Retention};
+
+    let pack = pack("orphan", 1);
+    let job = ColdJob::from_pack(&pack);
+    let mut sink = AsyncSink::new(2, job.byte_weight() * 2).unwrap();
+    let mut store = FaultStore::default();
+    store.fail(
+        &job.manifest_key,
+        Fault::Before(CacheError::Unauthorized),
+        2,
+    );
+    sink.enqueue(job.clone()).unwrap();
+    sink.enqueue(job.clone()).unwrap();
+    assert_eq!(sink.drain_report(&mut store, usize::MAX).unwrap().failed, 2);
+    for _ in 0..128 {
+        assert!(matches!(
+            sink.enqueue(job.clone()),
+            Err(CacheError::QuotaExceeded { .. })
+        ));
+        assert_eq!(
+            sink.drain_report(&mut store, usize::MAX).unwrap(),
+            DrainReport::default()
+        );
+        assert_eq!(
+            (sink.failed_count(), sink.retained_bytes()),
+            (2, job.byte_weight() * 2)
+        );
+    }
+    let mut ops = ColdOps::new(Retention::new(1).unwrap());
+    assert_eq!(ops.schedule_expired(u64::MAX), 0);
+    assert_eq!(ops.reclaim_one(&mut store).unwrap(), ReclaimStep::Idle);
+    sink.take_failed().unwrap();
+    sink.cancel();
+    drop(sink);
+    assert_eq!(store.deletes, 0);
+    assert_eq!(
+        store.head(&pack.object_key).unwrap().len,
+        pack.object_bytes.len() as u64
+    );
+    assert!(store.head(&pack.manifest_key).is_err());
+}

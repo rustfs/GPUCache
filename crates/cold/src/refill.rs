@@ -63,6 +63,9 @@ pub fn refill_generation(
 /// Match tenant and complete canonical identity before any payload download.
 /// Tenant mismatch is Unauthorized; other identity mismatch is a clean miss.
 /// Legacy manifests lack the required binding and are clean misses too.
+/// Missing objects, backend timeouts, unavailability and backpressure are clean
+/// misses at every read stage; validation and authorization errors stay errors.
+/// This read-only operation never retries, publishes, or removes an object.
 pub fn refill_matching(
     store: &dyn ObjectStore,
     manifest_key: &str,
@@ -76,15 +79,17 @@ pub fn refill_matching(
     }
     let meta = match store.head(manifest_key) {
         Ok(meta) => meta,
-        Err(CacheError::Storage {
-            reason: "object missing",
-        }) => return Ok(RefillOutcome::Missing),
+        Err(err) if crate::failure::refill_miss(&err) => return Ok(RefillOutcome::Missing),
         Err(err) => return Err(err),
     };
     if meta.len > budget.max_bytes {
         return Ok(RefillOutcome::OverBudget);
     }
-    let manifest_bytes = store.range_get(manifest_key, 0, meta.len)?;
+    let manifest_bytes = match store.range_get(manifest_key, 0, meta.len) {
+        Ok(bytes) => bytes,
+        Err(err) if crate::failure::refill_miss(&err) => return Ok(RefillOutcome::Missing),
+        Err(err) => return Err(err),
+    };
     if manifest_bytes.len() as u64 != meta.len || content_checksum(&manifest_bytes) != meta.checksum
     {
         return Err(CacheError::ChecksumMismatch);
@@ -117,9 +122,7 @@ pub fn refill_matching(
     }
     let payload = match store.range_get(&manifest.object_key, range.offset, range.length) {
         Ok(payload) => payload,
-        Err(CacheError::Storage {
-            reason: "object missing",
-        }) => return Ok(RefillOutcome::Missing),
+        Err(err) if crate::failure::refill_miss(&err) => return Ok(RefillOutcome::Missing),
         Err(err) => return Err(err),
     };
     if payload.len() as u64 != range.length || content_checksum(&payload) != range.checksum {

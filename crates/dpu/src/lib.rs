@@ -12,6 +12,7 @@
 mod ablation;
 mod degrade;
 mod demo;
+mod message;
 mod queue;
 mod reactor;
 mod target;
@@ -19,6 +20,7 @@ mod target;
 pub use ablation::{Ablation, Knob};
 pub use degrade::{all_faults, decide, DegradeDecision, Fault};
 pub use demo::{run_dpu_demo, DpuReport};
+pub use message::{HostSimulation, SimulationMessage, SimulationReply, SimulationStats};
 pub use queue::{
     dpu_feature_selected, dpu_probe, open_doca, open_nvme_device, open_spdk, ArmAgent, Completion,
     StorageQueue, TaskId,

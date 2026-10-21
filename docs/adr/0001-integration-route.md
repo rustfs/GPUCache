@@ -42,3 +42,7 @@ The V3 CPU slice did not run the spike and did not add SGLang or HiCache. See [0
 - Callers must not assume GPUCache can read an arbitrary engine's KV bytes.
 - Resharding, a different quant format, or a different layout ABI is a miss, not a conversion.
 - A later ADR will replace this status with Accepted and name the one route. Until then, engine adapters stay out of the tree.
+
+## CPU ABI spike (2026-10-20)
+
+ADR 0013 adds `EngineBlockContract` and a fake-block harness with independent expected identity, length, generation and checksum checks. This is a CPU spike, not an engine adapter or exported KV tensor. The integration route remains Pending; real export/import is `NOT_RUN_HARDWARE`, and the GPU/model campaign is `NOT_RUN_BUDGET`.

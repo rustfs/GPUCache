@@ -27,8 +27,8 @@ V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated regist
 | V2: paired TTFT/TPOT against native NIXL | `NOT_RUN_HARDWARE` |
 | V3: `dpu-bf3` feature slot, simulated DRAM slab + storage queue, SPDK affinity check | In progress. Devices are not linked. `open_doca` / `open_nvme_device` / `open_spdk` refuse. `dpu-demo` prints `NOT_RUN_HARDWARE` |
 | V3: one candidate offload (storage queue) and ablation stubs | Interface only. P2P, DPA, compression, and crypto offload stay `NOT_RUN_HARDWARE` when enabled. Hot-tier EC cannot be enabled |
-| V3: authz, replay window, integrity seal, rate limit, secret rotation, audit | CPU hooks in this tree. Not mTLS. Trusted-fabric boundary is [docs/adr/0007-trusted-fabric.md](docs/adr/0007-trusted-fabric.md) |
-| V3: rebalance, rolling upgrade, fault-domain isolation | In-process stubs on the V2 shard directory. They fence fills. They do not copy a replica |
+| V3: authz, replay window, integrity seal, rate limit, secret rotation, audit | ACL and rate admission enforced on every TCP data operation; bounded CPU replay/rotation hooks remain separate. Not mTLS. Trusted-fabric boundary is [docs/adr/0007-trusted-fabric.md](docs/adr/0007-trusted-fabric.md) |
+| V3: rebalance, rolling upgrade, fault-domain isolation | Atomic bounded membership updates and a bounded TCP shard client, with epoch fencing and restart tests. No membership consensus or durability replicas |
 | V3: degrade matrix (DPU restart, GPU reset, NIC flap, storage loss, NVMe timeout, control-plane loss, RustFS slow/down) | Simulated fault decisions request recompute. Unknown completions remain quarantined and charged until explicit drain. Tenant-scoped invalidation/reclaim cannot free referenced slots. Recovery is not proven on hardware |
 | V3: G4 retention, manifest version, reclaim, delete verification, tenant cold keys, backfill budget | Implemented against the mock. Live RustFS is `NOT_RUN_HARDWARE` |
 | V3: paired NIC-RDMA baseline vs DPU | `NOT_RUN_HARDWARE`. `tco=TCO_UNKNOWN`. `go_gate=NOT_EVALUATED`. TCP is not the DPU baseline |
@@ -36,7 +36,7 @@ V1 runs the cache contract on CPU. V2 adds a transport trait, a simulated regist
 | Mooncake-informed CPU contracts | Implemented in this tree. See [docs/MOONCAKE.md](docs/MOONCAKE.md) and [docs/adr/0009-mooncake-lessons.md](docs/adr/0009-mooncake-lessons.md). Mooncake is not linked. No NIC, Soft-RoCE, or DPU number is claimed |
 | Erasure coding and durability replicas | Will not be built. A lost or failed hot block is a clean miss, then recompute and repopulate. Cold durability is RustFS G4 |
 
-The integration route (native vLLM KV connector or LMCache) is **not chosen**. See [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md). Hot-tier failure policy is [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md). The V3 offload candidate is [docs/adr/0006-storage-queue-offload.md](docs/adr/0006-storage-queue-offload.md). It is a hypothesis pending a paired measurement, not a measured bottleneck.
+The integration route (native vLLM KV connector or LMCache) is **not chosen**. `engine-spike` exercises an independently specified ABI against explicitly fake blocks; it is not engine integration. The CPU completion gap map and remaining boundaries are in [docs/CPU_COMPLETION.md](docs/CPU_COMPLETION.md). See [docs/adr/0001-integration-route.md](docs/adr/0001-integration-route.md). Hot-tier failure policy is [docs/adr/0002-no-erasure-coding.md](docs/adr/0002-no-erasure-coding.md). The V3 offload candidate is [docs/adr/0006-storage-queue-offload.md](docs/adr/0006-storage-queue-offload.md). It is a hypothesis pending a paired measurement, not a measured bottleneck.
 
 ## What V1 A does
 
@@ -68,7 +68,7 @@ ABSENT -> RESERVED -> WRITING -> COMMITTED -> EVICTING -> ABSENT
 
 A failed or timed-out registered region goes to `QUARANTINED`. Lease expiry does not prove that a copy has stopped, so that buffer stays allocated until the owner attests drain or a newer store epoch fences it. Same tokens do not imply the same bytes: the logical prefix key and the physical byte key are different encodings. V1 reuses only within one tenant, one model, and one layout. A reshard, quant, or layout mismatch is a miss. There is no cross-tenant dedup. A longer hash chain can reuse a whole shorter committed block (`PrefixHit`); the service does not slice inside a block. See [docs/adr/0003-partial-prefix.md](docs/adr/0003-partial-prefix.md).
 
-Resource limits cover object size, writer admissions, memory registrations, per-tenant in-flight bytes, and retained payload bytes. They are not a complete process-RSS bound: reader pins, protocol reply allocations, and some auxiliary metadata still need admission limits. The idempotency table is bounded and scoped by authenticated tenant and trust domain.
+Resource limits cover object size, writer admissions, reader pins, aggregate Get reply payloads, memory registrations, per-tenant in-flight bytes, and retained payload bytes. Reader pins retain credit after expiry until explicit drain/fence. Routed clients bound connections and retry records; directory and cold metadata have hard ceilings. These are admission bounds, not a measured process-RSS guarantee. The idempotency table is bounded and scoped by authenticated tenant and trust domain.
 
 ## What you can run
 

@@ -63,6 +63,20 @@ batch semantics. `StoreStats::reader_pins` exposes the charged count. No new
 wire tag, identity field or configuration schema is introduced. Direct fenced
 reclaim authorizes before running timer maintenance.
 
+TCP additionally passes its `max_frame_bytes` reply-body ceiling to the store
+before Get admission. The protocol-owned budget reserves the exact 20-byte GCKR
+batch header and 85 metadata bytes per possible successful item, then allows
+payloads only within the remaining bytes and the codec's absolute field limit.
+Every item error is smaller than a successful item's metadata reservation;
+failed items conservatively keep that reservation for the rest of the batch.
+If metadata alone does not fit, the batch fails with the existing quota error,
+whose 21-byte failed reply fits even the minimum server frame limit. Otherwise
+over-budget items fail without copying payloads or creating pins. Successfully
+admitted items and their pin handles always fit the configured frame before
+encoding begins. The outer TCP envelope is separate from this body limit.
+Network failures after admission still retain unknown-completion pins under
+the existing drain/fence contract.
+
 ## Wire compatibility and deferred authentication
 
 GCK1 requests, GCKR replies and CacheIdentity are unchanged. Hello remains an
@@ -86,6 +100,12 @@ grants versus store policies, cross-tenant generations, cross-model/layout
 reads, batch rate limits across connections, a bounded denial audit, and restart
 with an old connection still open. Unit tests cover the bounded rate table and
 credential-safe ACL debugging.
+
+`crates/transport/tests/reply_budget.rs` uses 2 KiB frames and one/two-pin ceilings
+to cover oversized Gets, exact-size single and multi-item replies, mixed success
+and quota errors, pin drain, and subsequent requests on the same TCP connection.
+Storage tests assert zero pins after metadata/payload rejection. Codec tests
+check the budget against actual GCKR encodings and the absolute field cap.
 
 These tests use synthetic CPU payloads. They do not qualify encryption, hardware
 DMA drain, a distributed control-plane authority or any GPU/DPU transport.

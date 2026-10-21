@@ -35,6 +35,6 @@ pub use harden::{
     SecretRing, SecurityLog,
 };
 pub use negotiate::{negotiate, HELLO_OP, WIRE_VERSION};
-pub use reply::{decode_reply, encode_reply, ReplyBody, REPLY_MAGIC};
+pub use reply::{decode_reply, encode_reply, get_reply_payload_budget, ReplyBody, REPLY_MAGIC};
 
 pub use gpucache_core_types::Attestation;

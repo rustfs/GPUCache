@@ -91,6 +91,15 @@ def cpu_gates(offline=False):
                       (sys.executable, "scripts/ci/cpu_simulation_pair.py"),
                       ("status=CPU_SIMULATION_PAIR_OK", "hardware=NOT_RUN_HARDWARE",
                        "performance=NOT_A_PERFORMANCE_RESULT", "tco=TCO_UNKNOWN")))
+    gates.append(Gate("scaling-smoke", cargo + ("run", "-p", "gpucache-transport",
+                                               "--example", "scaling_smoke", "--quiet")
+                      + locked,
+                      ("status=SCALING_SMOKE_OK", "topology=SINGLE_PROCESS_LOCALHOST",
+                       "shard_counts=1,3,10", "verified_store_epochs=1,2,3",
+                       "stale_sessions=REJECTED", "inflight_puts=FENCED_MISS",
+                       "remapped_blocks=MISS_THEN_RECOMPUTE",
+                       "hardware=NOT_RUN_HARDWARE",
+                       "performance=NOT_A_PERFORMANCE_RESULT")))
     return gates
 
 

@@ -39,7 +39,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ```
 
-The runner uses `--locked` for Cargo resolution and fetches the locked dependencies before its offline metadata check, so a clean VM does not need an already populated cache unless `--offline` is selected. It checks Clippy with default and all features, checks the dependency contract and runner unit tests, runs doc tests and combined-feature tests, and exercises the CPU-compatible `rdma-nixl` and `dpu-bf3` feature slots. It also runs the reuse, fallback, shard, cold, DPU and paired-report demos. The current list contains 18 gates; the command list in `results.json` is authoritative for a retained run. Optional feature compilation does not link a device, and a demo's successful exit does not convert an unavailable hardware row into a pass.
+The runner uses `--locked` for Cargo resolution and fetches the locked dependencies before its offline metadata check, so a clean VM does not need an already populated cache unless `--offline` is selected. It checks Clippy with default and all features, checks the dependency contract and runner unit tests, runs doc tests and combined-feature tests, and exercises the CPU-compatible `rdma-nixl` and `dpu-bf3` feature slots. It also runs the reuse, fallback, shard, cold, DPU and paired-report demos. The current list contains 21 gates; the command list in `results.json` is authoritative for a retained run. Optional feature compilation does not link a device, and a demo's successful exit does not convert an unavailable hardware row into a pass.
 
 Manual reproduction of the optional feature contracts is:
 
@@ -140,3 +140,5 @@ These profiles remain unavailable until implemented and exercised. Physical flee
 ## CPU completion additions
 
 `engine-spike` checks fake-block ABI validation and keeps real engine work `NOT_RUN_HARDWARE` / `NOT_RUN_BUDGET`. `cpu-simulation-pair` compares checked synthetic payload digests from localhost TCP and host simulation, includes fault checks, and requires `NOT_A_PERFORMANCE_RESULT`. Neither gate contains product performance samples. See [CPU_COMPLETION.md](CPU_COMPLETION.md) for the gap map and remaining boundaries.
+
+`scaling-smoke` checks 1 → 3 → 10 independent localhost TCP servers with coordinated stop/join, increasing epochs, stale-session and in-flight-write rejection, per-shard roundtrips and remapped-key recomputation. It is `SINGLE_PROCESS_LOCALHOST`, uses synthetic blocks, and is not physical multi-host or performance evidence. See [SCALING.md](SCALING.md).

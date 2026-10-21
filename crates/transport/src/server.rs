@@ -377,7 +377,7 @@ fn handle_frame(shared: &Shared, body: &[u8]) -> Vec<u8> {
                     .unwrap_or_else(|err| err.into_inner())
                     .admit(&auth, &request, now);
                 match admission {
-                    Ok(()) => dispatch(&mut store, &auth, request, now),
+                    Ok(()) => dispatch(&mut store, &auth, request, now, shared.cfg.max_frame_bytes),
                     Err(error) => ReplyBody::Failed {
                         op: request_op(&request),
                         store_epoch: store.epoch(),
@@ -403,6 +403,7 @@ fn dispatch(
     auth: &gpucache_protocol::AuthContext,
     request: RequestBody,
     now: u64,
+    max_reply_bytes: usize,
 ) -> ReplyBody {
     let op = request_op(&request);
     let result = match request {
@@ -411,7 +412,9 @@ fn dispatch(
             store.reserve_put(auth, now, items).map(ReplyBody::Reserve)
         }
         RequestBody::Commit(items) => store.commit(auth, now, items).map(ReplyBody::Commit),
-        RequestBody::Get(items) => store.get(auth, now, items).map(ReplyBody::Get),
+        RequestBody::Get(items) => store
+            .get_with_reply_limit(auth, now, items, max_reply_bytes)
+            .map(ReplyBody::Get),
         RequestBody::ReleaseCancel(items) => store
             .release_cancel(auth, now, items)
             .map(ReplyBody::Release),

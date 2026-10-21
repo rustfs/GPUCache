@@ -229,12 +229,30 @@ impl FileStore {
         items: Vec<GetItem>,
     ) -> Result<BatchReply<GetHit>, CacheError> {
         let reply = self.inner.get(auth, now_ms, items)?;
+        Ok(self.touch_get_reply(reply))
+    }
+
+    /// Bound the encoded GCKR body before copying payloads or creating pins.
+    pub fn get_with_reply_limit(
+        &mut self,
+        auth: &AuthContext,
+        now_ms: u64,
+        items: Vec<GetItem>,
+        max_reply_bytes: usize,
+    ) -> Result<BatchReply<GetHit>, CacheError> {
+        let reply = self
+            .inner
+            .get_with_reply_limit(auth, now_ms, items, max_reply_bytes)?;
+        Ok(self.touch_get_reply(reply))
+    }
+
+    fn touch_get_reply(&mut self, reply: BatchReply<GetHit>) -> BatchReply<GetHit> {
         for item in &reply.items {
             if let Ok(hit) = &item.body {
                 self.touch(hit.generation);
             }
         }
-        Ok(reply)
+        reply
     }
 
     pub fn release_cancel(

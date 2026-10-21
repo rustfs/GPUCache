@@ -9,9 +9,10 @@ use gpucache_core_types::{
     RequestId, ResourceLimits,
 };
 use gpucache_protocol::{
-    ensure_deadline, fingerprints_equal, AuthContext, BatchReply, CommitItem, CommitOutcome,
-    GetHit, GetItem, InvalidateItem, InvalidateOutcome, ItemResult, LookupItem, LookupOutcome,
-    MissReason, ReleaseCancelItem, ReleaseOutcome, ReserveOutcome, ReservePutItem, TenantPolicy,
+    ensure_deadline, fingerprints_equal, get_reply_payload_budget, AuthContext, BatchReply,
+    CommitItem, CommitOutcome, GetHit, GetItem, InvalidateItem, InvalidateOutcome, ItemResult,
+    LookupItem, LookupOutcome, MissReason, ReleaseCancelItem, ReleaseOutcome, ReserveOutcome,
+    ReservePutItem, TenantPolicy,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,13 +374,38 @@ impl MemoryStore {
         now_ms: u64,
         items: Vec<GetItem>,
     ) -> Result<BatchReply<GetHit>, CacheError> {
+        self.get_inner(auth, now_ms, items, None)
+    }
+
+    /// Get with a GCKR reply-body ceiling, including all batch/item metadata.
+    /// Over-budget items fail before payload copying or reader pin creation.
+    pub fn get_with_reply_limit(
+        &mut self,
+        auth: &AuthContext,
+        now_ms: u64,
+        items: Vec<GetItem>,
+        max_reply_bytes: usize,
+    ) -> Result<BatchReply<GetHit>, CacheError> {
+        self.get_inner(auth, now_ms, items, Some(max_reply_bytes))
+    }
+
+    fn get_inner(
+        &mut self,
+        auth: &AuthContext,
+        now_ms: u64,
+        items: Vec<GetItem>,
+        max_reply_bytes: Option<usize>,
+    ) -> Result<BatchReply<GetHit>, CacheError> {
         self.prepare(
             auth,
             now_ms,
             &request_ids(items.iter().map(|i| i.header.request_id)),
         )?;
-        let mut out = Vec::with_capacity(items.len());
         let mut remaining = self.limits.max_object_bytes;
+        if let Some(limit) = max_reply_bytes {
+            remaining = remaining.min(get_reply_payload_budget(limit, items.len())?);
+        }
+        let mut out = Vec::with_capacity(items.len());
         for item in items {
             let id = item.header.request_id;
             let result = self.get_one(auth, now_ms, &item, remaining);

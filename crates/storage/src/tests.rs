@@ -736,6 +736,62 @@ fn batched_get_bounds_reply_payload_before_copy_or_pin() {
 }
 
 #[test]
+fn get_reply_limit_rejects_metadata_and_payload_overflow_without_pins() {
+    let (mut store, auth) = open(None);
+    let generation = commit_bytes(&mut store, &auth, 1, b"data");
+    let item = |store: &MemoryStore, n| GetItem {
+        header: hdr(store, n, 0),
+        generation,
+        identity: synthetic_identity(1, 1),
+        pin_ttl_ms: 100,
+    };
+    let quota = CacheError::QuotaExceeded {
+        kind: gpucache_core_types::QuotaKind::InFlightBytes,
+    };
+    for (n, limit) in [0, 20, 64, 104].into_iter().enumerate() {
+        let request = item(&store, 10 + n as u128);
+        assert_eq!(
+            store.get_with_reply_limit(&auth, 0, vec![request], limit),
+            Err(quota.clone())
+        );
+        assert_eq!(store.stats().reader_pins, 0);
+    }
+    for (n, limit) in [105, 108].into_iter().enumerate() {
+        let request = item(&store, 20 + n as u128);
+        let reply = store
+            .get_with_reply_limit(&auth, 0, vec![request], limit)
+            .unwrap();
+        assert_eq!(reply.items[0].body, Err(quota.clone()));
+        assert_eq!(store.stats().reader_pins, 0);
+        assert!(
+            gpucache_protocol::encode_reply(&gpucache_protocol::ReplyBody::Get(reply))
+                .unwrap()
+                .len()
+                <= limit
+        );
+    }
+    let mut wrong_auth = auth.clone();
+    wrong_auth.credential_fingerprint = [8; 32];
+    let request = item(&store, 30);
+    assert_eq!(
+        store.get_with_reply_limit(&wrong_auth, 0, vec![request], 0),
+        Err(CacheError::Unauthorized)
+    );
+    let request = item(&store, 31);
+    let reply = store
+        .get_with_reply_limit(&auth, 0, vec![request], 109)
+        .unwrap();
+    assert_eq!(reply.items[0].body.as_ref().unwrap().payload, b"data");
+    assert_eq!(store.stats().reader_pins, 1);
+    assert_eq!(
+        gpucache_protocol::encode_reply(&gpucache_protocol::ReplyBody::Get(reply))
+            .unwrap()
+            .len(),
+        109
+    );
+}
+
+#[test]
 fn idempotent_replay_and_conflict() {
     let (mut store, auth) = open(None);
     let payload = b"once".to_vec();

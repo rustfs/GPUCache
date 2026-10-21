@@ -15,6 +15,34 @@ use crate::negotiate::WIRE_VERSION;
 pub const REPLY_MAGIC: &[u8; 4] = b"GCKR";
 const OP_FAILED: u16 = 0;
 
+/// Aggregate Get payload allowance after reserving GCKR batch/item metadata.
+///
+/// Reserve the exact successful-item metadata for every item. Every encoded
+/// error is smaller, so failed items cannot consume another item's reservation.
+/// This conservative budget must be checked before creating any reader pins.
+/// The limit covers the reply body, excluding an outer transport envelope.
+pub fn get_reply_payload_budget(
+    max_reply_bytes: usize,
+    item_count: usize,
+) -> Result<u64, CacheError> {
+    // Magic/version/op/epoch/count, then request-id/status/GetHit/bytes length.
+    const BATCH_BYTES: usize = 4 + 2 + 2 + 8 + 4;
+    const ITEM_BYTES: usize = 16 + 1 + 8 + 8 + 32 + 8 + 8 + 4;
+    u32::try_from(item_count).map_err(|_| CacheError::QuotaExceeded {
+        kind: QuotaKind::BatchItems,
+    })?;
+    let available = item_count
+        .checked_mul(ITEM_BYTES)
+        .and_then(|bytes| bytes.checked_add(BATCH_BYTES))
+        .and_then(|metadata| max_reply_bytes.checked_sub(metadata))
+        .ok_or(CacheError::QuotaExceeded {
+            kind: QuotaKind::InFlightBytes,
+        })?;
+    // ByteWriter::bytes also has an absolute field cap. Keep even an unlimited
+    // caller from pinning data whose subsequent reply encoding would fail.
+    Ok(available.min(HARD_BYTES_CAP) as u64)
+}
+
 /// Encoded store reply. Request frames stay `GCK1`; this is the response side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplyBody {
@@ -547,6 +575,69 @@ mod tests {
 
     fn id(n: u128) -> RequestId {
         RequestId::from_counter(n).unwrap()
+    }
+
+    #[test]
+    fn get_budget_matches_the_wire_and_covers_error_metadata() {
+        for count in [0, 1, 2, 64, 1024] {
+            let batch = BatchReply {
+                store_epoch: u64::MAX,
+                items: (0..count)
+                    .map(|n| ItemResult {
+                        request_id: id(n as u128 + 1),
+                        body: Ok(GetHit {
+                            generation: u64::MAX,
+                            length: 3,
+                            checksum: content_checksum(b"abc"),
+                            region_id: u64::MAX,
+                            lease_deadline_ms: u64::MAX,
+                            payload: b"abc".to_vec(),
+                        }),
+                    })
+                    .collect(),
+            };
+            let frame_bytes = encode_reply(&ReplyBody::Get(batch.clone())).unwrap().len();
+            assert_eq!(
+                get_reply_payload_budget(frame_bytes, count),
+                Ok(count as u64 * 3)
+            );
+            // Include the widest error encoding (two u64 fields) and the
+            // quota error emitted when the successful payload would not fit.
+            for error in [
+                CacheError::EpochMismatch {
+                    store: u64::MAX,
+                    request: u64::MAX,
+                },
+                CacheError::QuotaExceeded {
+                    kind: QuotaKind::InFlightBytes,
+                },
+                CacheError::Unauthorized,
+            ] {
+                let mut denied = batch.clone();
+                for item in &mut denied.items {
+                    item.body = Err(error.clone());
+                }
+                assert!(encode_reply(&ReplyBody::Get(denied)).unwrap().len() <= frame_bytes);
+            }
+        }
+        assert!(get_reply_payload_budget(104, 1).is_err());
+        assert_eq!(get_reply_payload_budget(105, 1), Ok(0));
+        assert!(get_reply_payload_budget(usize::MAX, usize::MAX).is_err());
+        assert_eq!(
+            get_reply_payload_budget(usize::MAX, 1),
+            Ok(HARD_BYTES_CAP as u64)
+        );
+        let failed = encode_reply(&ReplyBody::Failed {
+            op: OP_GET,
+            store_epoch: u64::MAX,
+            error: CacheError::QuotaExceeded {
+                kind: QuotaKind::InFlightBytes,
+            },
+        })
+        .unwrap();
+        // Smaller than even the server's minimum 64-byte reply-body ceiling.
+        assert_eq!(failed.len(), 21);
+        assert!(decode_reply(&failed).is_ok());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use gpucache_core_types::{CacheError, QuotaKind};
 
-use crate::directory::{Admit, FillNotice, FillRequest, ShardDirectory, ShardParams};
+use crate::directory::{Admit, FillNotice, FillRequest, MemberView, ShardDirectory, ShardParams};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -107,6 +107,19 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Apply one complete membership view through the directory's atomic fence.
+    /// Failed validation or epoch exhaustion keeps fault-domain assignments and
+    /// pending fills intact. Draining upgrades do not accept membership changes.
+    pub fn apply_membership(&mut self, members: &[MemberView]) -> Result<u64, CacheError> {
+        if self.phase != Phase::Serving {
+            return Err(CacheError::Cancelled);
+        }
+        let epoch = self.dir.apply_membership(members)?;
+        self.domains
+            .retain(|node, _| members.iter().any(|member| member.node_id == *node));
+        Ok(epoch)
+    }
+
     /// Remove every member in `domain`. The last remaining member stays.
     /// In-flight fills are fenced and become misses. No payload is copied.
     /// If the epoch cannot advance for the entire batch, nothing is changed.
@@ -175,8 +188,14 @@ impl ControlPlane {
         if self.phase != Phase::Draining {
             return Err(CacheError::Malformed { reason: "upgrade" });
         }
+        let generation =
+            self.software_generation
+                .checked_add(1)
+                .ok_or(CacheError::FencingRejected {
+                    reason: "software generation exhausted",
+                })?;
         let epoch = self.dir.fence_epoch()?;
-        self.software_generation = self.software_generation.saturating_add(1);
+        self.software_generation = generation;
         self.upgraded = true;
         self.phase = Phase::Serving;
         Ok(UpgradeStamp {
@@ -320,6 +339,34 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_software_generation_does_not_fence_or_resume_a_draining_shard() {
+        let mut plane = ControlPlane::single_node(params());
+        let (flight_id, leader, waiter) = begin_leader_and_waiter(&mut plane);
+        plane.software_generation = u64::MAX;
+        plane.begin_upgrade().unwrap();
+        assert_eq!(
+            plane.finish_upgrade().err(),
+            Some(CacheError::FencingRejected {
+                reason: "software generation exhausted"
+            })
+        );
+        assert!(!plane.serving());
+        assert_eq!(plane.epoch(), leader.epoch);
+        assert_eq!(plane.inflight(), 1);
+        assert_eq!(plane.credits_used(), leader.bytes);
+        for request in [&leader, &waiter] {
+            assert_eq!(
+                plane.fill_notice(&request.tenant, request.request).unwrap(),
+                FillNotice::Pending
+            );
+        }
+        plane.rollback().unwrap();
+        plane
+            .complete_flight(flight_id, leader.epoch, leader.request)
+            .unwrap();
+    }
+
+    #[test]
     fn isolate_domain_refuses_to_remove_the_last_member() {
         let mut plane = ControlPlane::single_node(params());
         let node = plane.dir.members()[0].node_id;
@@ -342,6 +389,58 @@ mod tests {
         assert!(epoch > 1);
         assert_eq!(plane.inflight(), 0);
         assert!(plane.dir.members().iter().all(|member| member.node_id != 9));
+    }
+
+    #[test]
+    fn public_membership_admission_enables_fault_domain_isolation_and_refuses_during_upgrade() {
+        let mut plane = ControlPlane::single_node(params());
+        let members = [
+            MemberView {
+                node_id: 1,
+                incarnation: 1,
+            },
+            MemberView {
+                node_id: 2,
+                incarnation: 1,
+            },
+        ];
+        plane.apply_membership(&members).unwrap();
+        plane.assign_domain(1, 7).unwrap();
+        plane.assign_domain(2, 9).unwrap();
+        let (flight_id, leader, _) = begin_leader_and_waiter(&mut plane);
+        plane.begin_upgrade().unwrap();
+        assert_eq!(
+            plane.apply_membership(&members[..1]),
+            Err(CacheError::Cancelled)
+        );
+        assert_eq!(plane.inflight(), 1);
+        plane.rollback().unwrap();
+        let epoch = plane.isolate_domain(9).unwrap();
+        assert!(epoch > leader.epoch);
+        assert_eq!(plane.domains, BTreeMap::from([(1, 7)]));
+        assert_eq!(plane.credits_used(), 0);
+        assert!(matches!(
+            plane.complete_flight(flight_id, leader.epoch, leader.request),
+            Err(CacheError::EpochMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_membership_batch_retains_fault_domains_and_pending_fills() {
+        let mut plane = three_member_plane(u64::MAX);
+        let (_, leader, waiter) = begin_leader_and_waiter(&mut plane);
+        let domains = plane.domains.clone();
+        let members = plane.dir.members().to_vec();
+        assert!(plane.apply_membership(&members[..1]).is_err());
+        assert_eq!(plane.dir.members(), members);
+        assert_eq!(plane.domains, domains);
+        assert_eq!(plane.credits_used(), leader.bytes);
+        for request in [&leader, &waiter] {
+            assert_eq!(
+                plane.fill_notice(&request.tenant, request.request).unwrap(),
+                FillNotice::Pending
+            );
+        }
     }
 
     #[test]

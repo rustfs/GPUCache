@@ -97,6 +97,17 @@ struct Flight {
     waiters: BTreeSet<[u8; 16]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryStats {
+    pub flights: usize,
+    pub request_entries: usize,
+    pub notices: usize,
+    pub tenants: usize,
+    pub members: usize,
+    pub fence_count: u64,
+    pub fenced_fills: u64,
+}
+
 pub struct ShardDirectory {
     shard_id: u64,
     epoch: u64,
@@ -115,6 +126,8 @@ pub struct ShardDirectory {
     notices: BTreeMap<(Vec<u8>, [u8; 16]), FillNotice>,
     notice_order: VecDeque<(Vec<u8>, [u8; 16])>,
     max_notices: usize,
+    fence_count: u64,
+    fenced_fills: u64,
 }
 
 impl ShardDirectory {
@@ -145,11 +158,61 @@ impl ShardDirectory {
             next_flight: 1,
             notices: BTreeMap::new(),
             notice_order: VecDeque::new(),
+            fence_count: 0,
+            fenced_fills: 0,
             max_notices: params
                 .max_flights
                 .saturating_mul(params.max_waiters.saturating_add(1))
                 .max(1),
         }
+    }
+
+    pub fn stats(&self) -> DirectoryStats {
+        DirectoryStats {
+            flights: self.flights.len(),
+            request_entries: self.by_request.len(),
+            notices: self.notices.len(),
+            tenants: self.tenant_used.len(),
+            members: self.members.len(),
+            fence_count: self.fence_count,
+            fenced_fills: self.fenced_fills,
+        }
+    }
+
+    /// Apply one bounded membership snapshot atomically. Validation and epoch
+    /// capacity checks finish before membership, credits, or notices change.
+    /// There is no update queue: callers retry rejected snapshots explicitly.
+    pub fn apply_membership(&mut self, members: &[MemberView]) -> Result<u64, CacheError> {
+        if members.is_empty() || members.len() > self.max_members {
+            return Err(CacheError::Malformed {
+                reason: "membership",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for member in members {
+            if member.incarnation == 0 || !seen.insert(member.node_id) {
+                return Err(CacheError::Malformed {
+                    reason: "membership",
+                });
+            }
+            if self
+                .members
+                .iter()
+                .any(|old| old.node_id == member.node_id && old.incarnation > member.incarnation)
+            {
+                return Err(CacheError::FencingRejected { reason: "member" });
+            }
+        }
+        if members.len() == self.members.len()
+            && members.iter().all(|member| self.members.contains(member))
+        {
+            return Ok(self.epoch);
+        }
+        self.ensure_epoch_can_advance()?;
+        let epoch = self.fence_inflight()?;
+        self.members = members.to_vec();
+        self.members.sort_by_key(|member| member.node_id);
+        Ok(epoch)
     }
 
     pub fn shard_id(&self) -> u64 {
@@ -386,6 +449,8 @@ impl ShardDirectory {
             kind: QuotaKind::InFlightRequests,
         })?;
         self.epoch = next;
+        self.fence_count = self.fence_count.saturating_add(1);
+        self.fenced_fills = self.fenced_fills.saturating_add(self.flights.len() as u64);
         self.by_request.clear();
         self.by_id.clear();
         let flights = std::mem::take(&mut self.flights);
@@ -872,5 +937,115 @@ mod tests {
             dir.fill_notice(b"tenant-a", 1u128.to_le_bytes()).unwrap(),
             FillNotice::LeaderFinished
         );
+    }
+
+    #[test]
+    fn membership_batch_rejects_every_invalid_snapshot_before_fencing() {
+        let mut dir = ShardDirectory::single_node(params());
+        dir.note_member(2, 2).unwrap();
+        dir.begin_or_join(&fill(b"a", b"tenant-a", 10, 1, dir.epoch()))
+            .unwrap();
+        dir.begin_or_join(&fill(b"a", b"tenant-a", 10, 2, dir.epoch()))
+            .unwrap();
+        let before = dir.stats();
+        let members = dir.members().to_vec();
+        for candidate in [
+            vec![],
+            vec![MemberView {
+                node_id: 2,
+                incarnation: 1,
+            }],
+            vec![members[0], members[0]],
+            vec![MemberView {
+                node_id: 3,
+                incarnation: 0,
+            }],
+            (1..=5)
+                .map(|node_id| MemberView {
+                    node_id,
+                    incarnation: 2,
+                })
+                .collect(),
+        ] {
+            assert!(dir.apply_membership(&candidate).is_err());
+            assert_eq!(dir.stats(), before);
+            assert_eq!(dir.members(), members);
+            assert_eq!(dir.credits_used(), 10);
+            assert_eq!(
+                dir.fill_notice(b"tenant-a", 2u128.to_le_bytes()).unwrap(),
+                FillNotice::Pending
+            );
+        }
+        dir.set_epoch_for_test(u64::MAX);
+        assert!(dir.apply_membership(&[members[0]]).is_err());
+        assert_eq!(dir.stats(), before);
+        assert_eq!(dir.members(), members);
+    }
+
+    #[test]
+    fn batch_membership_is_order_independent_and_fences_once() {
+        let mut dir = ShardDirectory::single_node(params());
+        dir.note_member(2, 1).unwrap();
+        dir.begin_or_join(&fill(b"a", b"tenant-a", 10, 1, dir.epoch()))
+            .unwrap();
+        let mut same = dir.members().to_vec();
+        same.reverse();
+        assert_eq!(dir.apply_membership(&same).unwrap(), 2);
+        assert_eq!(dir.inflight(), 1);
+        let snapshot = [
+            MemberView {
+                node_id: 2,
+                incarnation: 2,
+            },
+            MemberView {
+                node_id: 3,
+                incarnation: 1,
+            },
+        ];
+        assert_eq!(dir.apply_membership(&snapshot).unwrap(), 3);
+        assert_eq!(dir.inflight(), 0);
+        assert_eq!(dir.credits_used(), 0);
+        assert_eq!(dir.stats().fenced_fills, 1);
+        assert_eq!(dir.stats().fence_count, 2);
+        assert_eq!(
+            dir.fill_notice(b"tenant-a", 1u128.to_le_bytes()).unwrap(),
+            FillNotice::Fenced
+        );
+    }
+
+    #[test]
+    fn cancel_restart_and_membership_storm_keep_every_table_bounded() {
+        let mut dir = ShardDirectory::single_node(params());
+        for n in 1..=2000u128 {
+            let epoch = dir.epoch();
+            let Admit::Leader { flight_id, .. } = dir
+                .begin_or_join(&fill(b"a", b"tenant-a", 10, n * 2, epoch))
+                .unwrap()
+            else {
+                panic!("leader")
+            };
+            dir.begin_or_join(&fill(b"a", b"tenant-a", 10, n * 2 + 1, epoch))
+                .unwrap();
+            if n % 2 == 0 {
+                dir.fence_epoch().unwrap();
+                assert!(dir
+                    .complete_flight(flight_id, epoch, (n * 2).to_le_bytes())
+                    .is_err());
+            } else {
+                dir.fail_flight(flight_id, epoch, (n * 2).to_le_bytes())
+                    .unwrap();
+                assert_eq!(
+                    dir.complete_flight(flight_id, epoch, (n * 2).to_le_bytes()),
+                    Err(CacheError::UnknownGeneration)
+                );
+            }
+            let stats = dir.stats();
+            assert_eq!(stats.flights, 0);
+            assert_eq!(stats.request_entries, 0);
+            assert_eq!(stats.tenants, 0);
+            assert!(stats.notices <= dir.max_notices);
+            assert!(dir.notice_order.len() <= dir.max_notices);
+            assert_eq!(dir.credits_used(), 0);
+        }
     }
 }

@@ -17,6 +17,17 @@ use crate::clock::Clock;
 use crate::frame::{read_envelope, write_envelope};
 use crate::pool::Pool;
 
+/// Counts complete application envelopes, including the hello exchange.
+/// A framed envelope adds 12 bytes. TCP/IP headers, retransmission, and partial
+/// failed writes/reads are excluded; these counters are not NIC wire telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientIoStats {
+    pub rpc_body_bytes_sent: u64,
+    pub rpc_body_bytes_received: u64,
+    pub framed_bytes_sent: u64,
+    pub framed_bytes_received: u64,
+}
+
 pub struct TcpClient {
     stream: TcpStream,
     auth: AuthContext,
@@ -25,6 +36,7 @@ pub struct TcpClient {
     epoch: u64,
     clock: Clock,
     usable: bool,
+    io_stats: ClientIoStats,
 }
 
 impl TcpClient {
@@ -73,7 +85,25 @@ impl TcpClient {
             epoch,
             clock: Clock::new(envelope.server_now),
             usable: true,
+            io_stats: ClientIoStats {
+                rpc_body_bytes_sent: hello.len() as u64,
+                rpc_body_bytes_received: envelope.body().len() as u64,
+                framed_bytes_sent: hello.len() as u64 + 12,
+                framed_bytes_received: envelope.body().len() as u64 + 12,
+            },
         })
+    }
+
+    pub fn io_stats(&self) -> ClientIoStats {
+        self.io_stats
+    }
+
+    pub(crate) fn is_usable(&self) -> bool {
+        self.usable
+    }
+
+    pub(crate) fn server_now(&self) -> u64 {
+        self.clock.server_now()
     }
 
     pub fn epoch(&self) -> u64 {
@@ -158,7 +188,23 @@ impl TcpClient {
         // incomplete exchange, a late reply must never answer a later call.
         self.usable = false;
         write_envelope(&mut self.stream, 0, &bytes, self.max_frame)?;
+        self.io_stats.rpc_body_bytes_sent = self
+            .io_stats
+            .rpc_body_bytes_sent
+            .saturating_add(bytes.len() as u64);
+        self.io_stats.framed_bytes_sent = self
+            .io_stats
+            .framed_bytes_sent
+            .saturating_add(bytes.len() as u64 + 12);
         let envelope = read_envelope(&mut self.stream, self.pool.checkout()?, self.max_frame)?;
+        self.io_stats.rpc_body_bytes_received = self
+            .io_stats
+            .rpc_body_bytes_received
+            .saturating_add(envelope.body().len() as u64);
+        self.io_stats.framed_bytes_received = self
+            .io_stats
+            .framed_bytes_received
+            .saturating_add(envelope.body().len() as u64 + 12);
         match decode_reply(envelope.body())? {
             ReplyBody::Failed {
                 op,
@@ -496,5 +542,26 @@ mod tests {
                 reason: "transport io"
             })
         ));
+    }
+
+    #[test]
+    fn io_counters_separate_complete_rpc_body_and_framed_bytes() {
+        let (mut client, server) = fake_server(vec![encode_reply(&lookup_reply(1, &[1])).unwrap()]);
+        let before = client.io_stats();
+        assert_eq!(before.framed_bytes_sent - before.rpc_body_bytes_sent, 12);
+        assert_eq!(
+            before.framed_bytes_received - before.rpc_body_bytes_received,
+            12
+        );
+        client.lookup(vec![lookup_item(1)]).unwrap();
+        let after = client.io_stats();
+        assert_eq!(after.framed_bytes_sent - after.rpc_body_bytes_sent, 24);
+        assert_eq!(
+            after.framed_bytes_received - after.rpc_body_bytes_received,
+            24
+        );
+        assert!(after.rpc_body_bytes_sent > before.rpc_body_bytes_sent);
+        assert!(after.rpc_body_bytes_received > before.rpc_body_bytes_received);
+        server.join().unwrap();
     }
 }

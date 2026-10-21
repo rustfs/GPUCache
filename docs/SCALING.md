@@ -226,9 +226,34 @@ before publishing a snapshot; do not silently lower the target.
 Client defaults allow 64 shards, 64 total connections, and 4 connections per
 shard. A server defaults to 16 accepted connections across all clients. Multiple
 client processes each have their own pool, so increasing the shard count does
-not establish a capacity plan. Configure the library's `ClientLimits`,
-`ServerConfig`, and store `ResourceLimits` for the actual workload and handle
-quota rejection with recomputation. A 10-service smoke test is not evidence for
+not establish a capacity plan. Choose limits when constructing the client;
+`replace_routes` does not modify `ClientLimits`. For example, application code
+that already supplies `auth` and verified initial `endpoints` can provision this
+one-connection-per-shard configuration before the first stage:
+
+```rust
+use gpucache_transport::{ClientLimits, ShardedClient};
+
+let limits = ClientLimits {
+    max_shards: 10,
+    max_connections: 10,
+    max_connections_per_shard: 1,
+    max_frame_bytes: 2 * 1024 * 1024,
+    ..ClientLimits::default()
+};
+let client = ShardedClient::new(auth, endpoints, limits)?;
+```
+
+Reducing only `max_connections` to 3 while retaining the default per-shard cap of
+4 is invalid. The configuration above supports the final ten-shard topology from
+the outset. Size the library's `ServerConfig` and store `ResourceLimits` as well,
+and handle quota rejection with recomputation.
+
+The standalone CLI server uses a 2 MiB frame-body cap, matched above by
+`max_frame_bytes`. Frame limits are not negotiated; configure matching client
+and server limits. A client with a smaller receive cap can reject a reply that
+its server admitted. The executable `scaling_smoke` instead uses matching 1 MiB
+library defaults on both sides. A 10-service smoke test is not evidence for
 10 physical hosts or PB scale.
 
 Mutation retries remain disabled by default. Enabling them requires an explicit
